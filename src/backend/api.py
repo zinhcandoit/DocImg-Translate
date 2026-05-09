@@ -147,18 +147,37 @@ async def render_pdf(req: TranslateRequest):
     if not doc:
         return {"status": "error", "message": "Document not found"}
 
-    translated_middle = doc.get("translated_middle")
-    if not translated_middle:
-        return {"status": "error", "message": "No translated middle.json — run /translate first"}
+    middle_data = doc.get("middle_json")
+    if not middle_data:
+        return {"status": "error", "message": "No middle.json found"}
 
+    # Find origin PDF path
+    input_dir = Path("input_docs")
+    origin_pdf_path = input_dir / doc["filename"]
+    
     images_dir = doc.get("images_dir")
     renderer = PDFRenderer(images_dir=images_dir)
 
     output_path = OUTPUT_DIR / f"{req.doc_id}_translated.pdf"
-    renderer.render(translated_middle, str(output_path))
+    
+    # Render with NLLB service for live translation if requested, 
+    # but here we use the original layout data and translate inside the renderer
+    renderer.render(middle_data, str(origin_pdf_path), str(output_path), nllb_service=nllb)
 
     doc["pdf_path"] = str(output_path)
     return {"status": "success", "pdf_path": str(output_path)}
+
+
+@app.get("/stream-pdf/{doc_id}")
+async def stream_pdf(doc_id: str):
+    """Stream the rendered translated PDF for preview."""
+    doc = doc_store.get(doc_id)
+    if not doc or "pdf_path" not in doc:
+        return {"status": "error", "message": "PDF not found"}
+    return FileResponse(
+        doc["pdf_path"],
+        media_type="application/pdf",
+    )
 
 
 @app.get("/download/{doc_id}")
@@ -170,7 +189,7 @@ async def download_pdf(doc_id: str):
     return FileResponse(
         doc["pdf_path"],
         media_type="application/pdf",
-        filename=f"{doc.get('filename', 'translated')}_vi.pdf",
+        filename=f"{Path(doc.get('filename', 'translated')).stem}_vi.pdf",
     )
 
 

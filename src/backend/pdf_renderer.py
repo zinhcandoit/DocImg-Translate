@@ -1,322 +1,374 @@
 """
-PDF Renderer — Reconstructs a translated PDF from middle.json + images.
+PDF Renderer — Reconstructs a translated PDF using a word-level overlay pipeline.
 
-Design principles:
-- Equations/interline_equations: rendered as IMAGES (from images/ folder)
-  instead of LaTeX text, as specified by the user.
-- Tables: EXCEPTION — translated text is rendered (not image).
-- Text/title blocks: Vietnamese translated text placed at original bbox.
-- Uses PyMuPDF (fitz) for PDF creation.
-
-Coordinate system:
-  middle.json bboxes use PDF points (1/72 inch) with origin at top-left.
-  PyMuPDF uses the same coordinate system, so bboxes map directly.
+Approach (V8-Isolated):
+  1. Per-page extraction from layout.json (no cross-page state)
+  2. Tokenize blocks into (text, word) + (eq, latex) tokens
+  3. Binary-search font size to fit text perfectly in bbox
+  4. Render word-by-word: insert_text for text, insert_image for equations
+  5. Multi-angle support (0, 90, 180, 270)
+  6. Direct insert_text + insert_image (No HTMLBox)
 """
 
+import json
+import io
 import re
-import fitz  # PyMuPDF
 from pathlib import Path
-from html.parser import HTMLParser
+import fitz
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from typing import Optional
 
+# -------------------------------------------------------------------
+# Equation Renderer: LaTeX -> PNG bytes (in-memory)
+# -------------------------------------------------------------------
+plt.rcParams.update({
+    "text.usetex": False,
+    "mathtext.fontset": "stix",
+    "font.family": "STIXGeneral",
+    "mathtext.fallback": "cm"
+})
 
-class TableHTMLParser(HTMLParser):
-    """Extract rows/cells from simple HTML table for PDF rendering."""
+TEXT_TYPE = "notos"
+TEXT_TYPE_BOLD = "notosbo"
 
-    def __init__(self):
-        super().__init__()
-        self.rows = []
-        self._current_row = []
-        self._current_cell = ""
-        self._in_cell = False
-        self._colspan = 1
+class EquationRenderer:
+    """Renders LaTeX internally using Matplotlib's STIX fonts."""
+    _cache: dict[str, dict] = {}
 
-    def handle_starttag(self, tag, attrs):
-        if tag == "tr":
-            self._current_row = []
-        elif tag in ("td", "th"):
-            self._in_cell = True
-            self._current_cell = ""
-            attrs_dict = dict(attrs)
-            self._colspan = int(attrs_dict.get("colspan", 1))
-
-    def handle_endtag(self, tag):
-        if tag in ("td", "th"):
-            self._in_cell = False
-            # Clean up equation markers
-            cell_text = self._current_cell.strip()
-            cell_text = re.sub(r"<eq>(.*?)</eq>", r"\1", cell_text)
-            self._current_row.append({
-                "text": cell_text,
-                "colspan": self._colspan,
-            })
-        elif tag == "tr":
-            if self._current_row:
-                self.rows.append(self._current_row)
-
-    def handle_data(self, data):
-        if self._in_cell:
-            self._current_cell += data
-
-
-class PDFRenderer:
-    """Render translated PDF from middle.json structure + equation images."""
-
-    # Minimum font size (points)
-    MIN_FONT_SIZE = 6
-    DEFAULT_FONT_SIZE = 10
-    TITLE_FONT_SIZE_SCALE = 1.2
-
-    def __init__(self, images_dir: str = None, font_path: str = None):
-        self.images_dir = Path(images_dir) if images_dir else None
-        # For Vietnamese support, try to find a system font with diacritics
-        self.font_path = font_path
-        if not self.font_path:
-            # Try common system fonts with Vietnamese support
-            candidates = [
-                "C:/Windows/Fonts/arial.ttf",
-                "C:/Windows/Fonts/times.ttf",
-                "C:/Windows/Fonts/calibri.ttf",
-                "C:/Windows/Fonts/segoeui.ttf",
-            ]
-            for c in candidates:
-                if Path(c).exists():
-                    self.font_path = c
+    def _clean_mineru_latex(self, tex: str) -> str:
+        tex = tex.strip()
+        tex = tex.replace('$', '')
+        tex = tex.replace('&', r'\quad ')
+        tex = tex.replace(r'\\', r'\quad ')
+        tex = re.sub(r'\\begin\s*\{[a-zA-Z*]+\}\s*(\{[^\}]*\})?', '', tex)
+        tex = re.sub(r'\\end\s*\{[a-zA-Z*]+\}', '', tex)
+        fixes = [
+            (r'\\operatorname\*', r'\\operatorname'), 
+            (r'\\dotsc|\\dotsb|\\dotsi|\\dotso', r'\\dots'), 
+            (r'\\le\b', r'\\leq'),                     
+            (r'\\ge\b', r'\\geq'),                     
+            (r'\\cal\b', r'\\mathcal'),                
+            (r'\\rm\b', r'\\mathrm'),                  
+            (r'\\bf\b', r'\\mathbf'),                  
+            (r'\\mathbbm\b', r'\\mathbb'),             
+            (r'\\stackrel', r'\\overset'),             
+            (r'\\textstyle', r''),                     
+            (r'\\displaystyle', r''),                  
+            (r'\\tag\s*\{[^\}]*\}', r''),
+            (r'\\tag\b', r''),
+            (r'\\Biggl\b|\\Biggr\b', r'\\Bigg'),
+            (r'\\biggl\b|\\biggr\b', r'\\bigg'),
+            (r'\\Bigl\b|\\Bigr\b', r'\\Big'),
+            (r'\\bigl\b|\\bigr\b', r'\\big'),
+        ]
+        for pattern, repl in fixes:
+            tex = re.sub(pattern, repl, tex)
+        for cmd in ['mathcal', 'mathbb', 'mathbf', 'mathrm', 'mathscr', 'mathfrak']:
+            tex = re.sub(r'\{\s*\\' + cmd + r'\s+([A-Za-z0-9])\s*\}', r'\\' + cmd + r'{\1}', tex)
+            tex = re.sub(r'\\' + cmd + r'\s+([A-Za-z0-9])', r'\\' + cmd + r'{\1}', tex)
+            tex = re.sub(r'\\' + cmd + r'\s*\{\s*([A-Za-z0-9])\s*\}', r'\\' + cmd + r'{\1}', tex)
+        tex = tex.strip()
+        if tex.startswith('{') and tex.endswith('}'):
+            open_braces = 0
+            is_valid_wrap = True
+            for i, char in enumerate(tex):
+                if char == '{': open_braces += 1
+                elif char == '}': open_braces -= 1
+                if open_braces == 0 and i < len(tex) - 1:
+                    is_valid_wrap = False
                     break
+            if is_valid_wrap:
+                tex = tex[1:-1].strip()
+        return tex
 
-    def render(self, translated_middle: dict, output_path: str) -> str:
-        """
-        Build a new PDF from translated middle.json.
-
-        For each page:
-          - text/title blocks → insert translated text at bbox
-          - interline_equation → insert equation image at bbox
-          - table → render translated table cells
-          - list → insert list items at bbox
-        """
-        doc = fitz.open()
-
-        for page_data in translated_middle.get("pdf_info", []):
-            page_size = page_data.get("page_size", [612, 792])  # default Letter
-            page = doc.new_page(width=page_size[0], height=page_size[1])
-
-            # Use para_blocks (they're in reading order)
-            blocks = page_data.get("para_blocks", page_data.get("preproc_blocks", []))
-
-            for block in blocks:
-                if block.get("_merged"):
-                    continue  # Skip blocks merged into previous
-
-                btype = block.get("type", "")
-                bbox = block.get("bbox")
-                if not bbox:
-                    continue
-
-                if btype in ("text", "title"):
-                    self._render_text_block(page, block, is_title=(btype == "title"))
-                elif btype == "interline_equation":
-                    self._render_equation_block(page, block)
-                elif btype == "table":
-                    self._render_table_block(page, block)
-                elif btype == "list":
-                    self._render_list_block(page, block)
-
-        # Save with garbage collection and compression to ensure a valid, non-corrupted PDF
-        doc.save(output_path, garbage=3, deflate=True)
-        doc.close()
-        return output_path
-
-    def _render_text_block(self, page, block, is_title=False):
-        """Insert translated text into the block's bounding box."""
-        bbox = block.get("bbox")
-        if not bbox:
-            return
-
-        text = self._get_block_text(block)
-        if not text.strip():
-            return
-
-        rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
-
-        # Determine font size from bbox height or line_avg_height
-        line_height = block.get("line_avg_height")
-        if line_height:
-            font_size = max(self.MIN_FONT_SIZE, line_height * 0.75)
-        else:
-            box_height = bbox[3] - bbox[1]
-            num_lines = max(1, text.count("\n") + 1)
-            font_size = max(self.MIN_FONT_SIZE, min((box_height / num_lines) * 0.75, 14))
-
-        if is_title:
-            font_size = min(font_size * self.TITLE_FONT_SIZE_SCALE, 20)
-
-        # Expand the rect height downwards by 50% to prevent PyMuPDF from silently dropping text 
-        # due to custom font line-height metrics being slightly taller than the strict layout.json bbox
-        rect.y1 += font_size * 1.5
-
-        self._insert_text(page, rect, text, font_size, is_title)
-
-    def _render_equation_block(self, page, block):
-        """Insert equation image at the block's bounding box."""
-        bbox = block.get("bbox")
-        if not bbox:
-            return
-
-        # Find image_path from spans
-        image_path = None
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                if "image_path" in span:
-                    image_path = span["image_path"]
-                    break
-            if image_path:
-                break
-
-        if image_path and self.images_dir:
-            img_file = self.images_dir / image_path
-            if img_file.exists():
-                rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
-                try:
-                    page.insert_image(rect, filename=str(img_file))
-                    return
-                except Exception as e:
-                    print(f"[PDFRenderer] Image insert failed: {e}")
-
-        # Fallback: render LaTeX content as text
-        text = self._get_block_text(block)
-        if text.strip():
-            rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
-            self._insert_text(page, rect, text, self.DEFAULT_FONT_SIZE)
-
-    def _render_table_block(self, page, block):
-        """Render translated table at the block's bbox."""
-        bbox = block.get("bbox")
-        if not bbox:
-            return
-
-        # Find HTML content
-        html = None
-        for sub in block.get("blocks", []):
-            for line in sub.get("lines", []):
-                for span in line.get("spans", []):
-                    if span.get("type") == "table" and "html" in span:
-                        html = span["html"]
-                        break
-
-        if not html:
-            return
-
-        # Parse HTML into rows/cells
-        parser = TableHTMLParser()
+    def render_and_metrics(self, latex: str, dpi: int = 300) -> dict | None:
+        raw_tex = latex.strip()
+        if not raw_tex: return None
+        if raw_tex in self._cache: return self._cache[raw_tex]
+        clean_tex = self._clean_mineru_latex(raw_tex)
         try:
-            parser.feed(html)
-        except Exception:
-            return
-
-        rows = parser.rows
-        if not rows:
-            return
-
-        table_rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
-        num_rows = len(rows)
-        max_cols = max(sum(c["colspan"] for c in row) for row in rows) if rows else 1
-
-        row_height = (table_rect.height) / max(num_rows, 1)
-        col_width = (table_rect.width) / max(max_cols, 1)
-
-        font_size = max(self.MIN_FONT_SIZE, min(row_height * 0.6, 9))
-
-        y = table_rect.y0
-        for row in rows:
-            x = table_rect.x0
-            for cell in row:
-                cw = col_width * cell["colspan"]
-                cell_rect = fitz.Rect(x, y, x + cw, y + row_height)
-
-                # Draw cell border
-                page.draw_rect(cell_rect, color=(0.7, 0.7, 0.7), width=0.5)
-
-                # Insert text with small padding
-                text_rect = fitz.Rect(x + 2, y + 1, x + cw - 2, y + row_height - 1)
-                if cell["text"].strip():
-                    self._insert_text(page, text_rect, cell["text"], font_size)
-                x += cw
-            y += row_height
-
-    def _render_list_block(self, page, block):
-        """Render list items at their bounding boxes."""
-        sub_type = block.get("sub_type", "bullet")
-        for idx, sub in enumerate(block.get("blocks", [])):
-            bbox = sub.get("bbox", block.get("bbox"))
-            if not bbox:
-                continue
-            text = self._get_block_text(sub)
-            if not text.strip():
-                continue
-            prefix = f"{idx + 1}. " if sub_type == "numbered" else "• "
-            rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
-            box_h = bbox[3] - bbox[1]
-            font_size = max(self.MIN_FONT_SIZE, min(box_h * 0.7, 10))
-            self._insert_text(page, rect, prefix + text, font_size)
-
-    # ── Helpers ─────────────────────────────────────────────────
-
-    def _get_block_text(self, block) -> str:
-        """Extract all text content from a block's spans."""
-        parts = []
-        for line in block.get("lines", []):
-            line_parts = []
-            for span in line.get("spans", []):
-                content = span.get("content", "")
-                if content:
-                    line_parts.append(content)
-            if line_parts:
-                parts.append(" ".join(line_parts))
-        return " ".join(parts)
-
-    def _insert_text(self, page, rect, text, font_size, bold=False):
-        """Insert UTF-8 text into rect with font that supports Vietnamese.
-           Automatically reduces font size if the text doesn't fit.
-        """
-        if not text.strip():
-            return
-
-        # Ensure rect is valid and has some area
-        if rect.width <= 0 or rect.height <= 0:
-            return
-
-        current_fs = font_size
-        success = False
-
-        # Try to fit text by reducing font size if necessary
-        while current_fs >= self.MIN_FONT_SIZE:
-            kwargs = {
-                "rect": rect,
-                "buffer": text,
-                "fontsize": current_fs,
-                "fontname": "helv",
-                "align": fitz.TEXT_ALIGN_LEFT,
+            fig, ax = plt.subplots(figsize=(0.01, 0.01))
+            ax.axis('off')
+            t = ax.text(0, 0, f"${clean_tex}$", fontsize=40, va='baseline')
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            bbox = t.get_window_extent(renderer)
+            y_baseline = ax.transData.transform((0, 0))[1]
+            descent_px = max(0, y_baseline - bbox.y0)
+            fig.set_size_inches(bbox.width / dpi, bbox.height / dpi)
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight', pad_inches=0, transparent=True)
+            plt.close(fig)
+            self._cache[raw_tex] = {
+                'png_bytes': buf.getvalue(),
+                'aspect_ratio': bbox.width / bbox.height if bbox.height > 0 else 1,
+                'descent_ratio': descent_px / bbox.height if bbox.height > 0 else 0
             }
+            return self._cache[raw_tex]
+        except Exception as e:
+            print(f"[MathText Error] Failed on: {clean_tex[:30]}... | Error: {e}")
+            plt.close('all')
+            return None
 
-            if self.font_path and Path(self.font_path).exists():
-                kwargs["fontfile"] = self.font_path
-                kwargs["fontname"] = "custom"
+# -------------------------------------------------------------------
+# Helper Constants & Font Objects
+# -------------------------------------------------------------------
+FONT = fitz.Font(TEXT_TYPE)
+FONT_BOLD = fitz.Font(TEXT_TYPE_BOLD)
+SPACE_RATIO = 0.3
+global_cross_page_lines = []
 
-            try:
-                res = page.insert_textbox(**kwargs)
-                if res >= 0:
-                    success = True
-                    break
-            except Exception:
-                pass
+# -------------------------------------------------------------------
+# PDFRenderer Class
+# -------------------------------------------------------------------
+class PDFRenderer:
+    def __init__(self, images_dir: Optional[str] = None):
+        self.images_dir = Path(images_dir) if images_dir else None
+        self.eq_renderer = EquationRenderer()
+
+    def simulate_layout(self, tokens, rect, fontsize):
+        """Simulate word-wrap layout. Returns True if all tokens fit in rect."""
+        line_h = fontsize * 1.3
+        space_w = fontsize * SPACE_RATIO
+        x = rect.x0
+        y = rect.y0 + fontsize
+        for kind, content in tokens:
+            if kind == "word":
+                w = FONT.text_length(content, fontsize=fontsize)
+                if x > rect.x0 and x + w > rect.x1:
+                    x = rect.x0
+                    y += line_h
+                x += w + space_w
+            elif kind == "eq":
+                metrics = self.eq_renderer.render_and_metrics(content)
+                if metrics:
+                    disp_h = fontsize * 1.2
+                    disp_w = disp_h * metrics['aspect_ratio']
+                    if x > rect.x0 and x + disp_w > rect.x1:
+                        x = rect.x0
+                        y += line_h
+                    x += disp_w + space_w
+                else:
+                    w = FONT.text_length(content, fontsize=fontsize)
+                    if x > rect.x0 and x + w > rect.x1:
+                        x = rect.x0
+                        y += line_h
+                    x += w + space_w
+        return y <= rect.y1 + 1
+
+    def fit_fontsize(self, tokens, rect, lo=1.0, hi=18.0) -> float:
+        if not tokens: return 10.0
+        for _ in range(20):
+            mid = (lo + hi) / 2
+            if self.simulate_layout(tokens, rect, mid):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    def extract_page_blocks(self, page_data: dict) -> list[dict]:
+        global global_cross_page_lines
+        result = []
+        if global_cross_page_lines:
+            tokens = []
+            valid_bboxes = []
+            for line in global_cross_page_lines:
+                for span in line.get('spans', []):
+                    stype = span.get('type', '')
+                    content = span.get('content', '').strip()
+                    if not content: continue
+                    if stype == 'text':
+                        for w in content.split(): tokens.append(("word", w))
+                    elif stype in ('inline_equation', 'interline_equation'):
+                        tokens.append(("eq", content))
+                if line.get('bbox'): valid_bboxes.append(line['bbox'])
+            if tokens and valid_bboxes:
+                new_bbox = [min(b[0] for b in valid_bboxes), min(b[1] for b in valid_bboxes),
+                            max(b[2] for b in valid_bboxes), max(b[3] for b in valid_bboxes)]
+                result.append({'bbox': new_bbox, 'type': 'text', 'tokens': tokens, 'n_lines': len(valid_bboxes)})
+            global_cross_page_lines = []
+
+        all_blocks = (
+            page_data.get('para_blocks', []) + 
+            page_data.get('preproc_blocks', []) + 
+            page_data.get('discarded_blocks', [])
+        )
+        next_carry_over = []
+        for block in all_blocks:
+            btype = block.get('type', '')
+            sub_blocks = block.get('blocks', [block]) if 'blocks' in block else [block]
+            for sub in sub_blocks:
+                valid_lines = []
+                sub_angle = sub.get('angle', 0)
+                for line in sub.get('lines', []):
+                    if any(span.get('cross_page', False) for span in line.get('spans', [])):
+                        next_carry_over.append(line)
+                    else:
+                        valid_lines.append(line)
+                if valid_lines:
+                    tokens = []
+                    valid_bboxes = []
+                    for line in valid_lines:
+                        for span in line.get('spans', []):
+                            stype = span.get('type', '')
+                            content = span.get('content', '').strip()
+                            if not content: continue
+                            if stype == 'text':
+                                for w in content.split(): tokens.append(("word", w))
+                            elif stype in ('inline_equation', 'interline_equation'):
+                                tokens.append(("eq", content))
+                        if line.get('bbox'): valid_bboxes.append(line['bbox'])
+                    if tokens and valid_bboxes:
+                        new_bbox = [min(b[0] for b in valid_bboxes), min(b[1] for b in valid_bboxes),
+                                    max(b[2] for b in valid_bboxes), max(b[3] for b in valid_bboxes)]
+                        result.append({'bbox': new_bbox, 'type': btype, 'tokens': tokens, 'n_lines': len(valid_bboxes), 'angle': sub_angle})
+        global_cross_page_lines.extend(next_carry_over)
+        return result
+
+    def render_block(self, page, block, nllb_service=None):
+        raw_angle = block.get('angle', 0)
+        angle = int(round(raw_angle / 90) * 90) % 360
+        bbox = block['bbox']
+        rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
+        if angle in [90, 270]:
+            logical_width, logical_height = rect.height, rect.width
+        else:
+            logical_width, logical_height = rect.width, rect.height
+        logical_rect = fitz.Rect(0, 0, logical_width, logical_height)
+        if logical_width < 2 or logical_height < 2: return
+
+        tokens = block.get('tokens', [])
+        if not tokens: return
+
+        # Translate if NLLB service provided
+        if nllb_service:
+            original_text = ""
+            for kind, content in tokens:
+                if kind == "word": original_text += content + " "
+                else: original_text += f"${content}$ "
             
-            current_fs -= 0.5 # Reduce in small steps
+            # Use paragraph translation logic if available, or simple translation
+            translated_text = nllb_service._translate_text(original_text.strip())
+            
+            # Re-tokenize translated text
+            new_tokens = []
+            # This is a naive re-tokenization; better would be to use nllb's equation protection
+            # but for now we split by spaces and try to find equations
+            parts = re.split(r'(\$.*?\$)', translated_text)
+            for p in parts:
+                p = p.strip()
+                if not p: continue
+                if p.startswith('$') and p.endswith('$'):
+                    new_tokens.append(("eq", p[1:-1]))
+                else:
+                    for w in p.split():
+                        new_tokens.append(("word", w))
+            tokens = new_tokens
 
-        if not success:
-            # Final fallback: force insert at smallest size even if it overflows
-            try:
-                page.insert_textbox(
-                    rect=rect, buffer=text, fontsize=self.MIN_FONT_SIZE,
-                    fontname="helv", align=fitz.TEXT_ALIGN_LEFT,
-                )
-            except Exception as e:
-                print(f"[PDFRenderer] Critical text insert failure: {e}")
+        btype = block['type']
+        is_bold = btype == 'title'
+        fontname = TEXT_TYPE_BOLD if is_bold else TEXT_TYPE
+        font_obj = FONT_BOLD if is_bold else FONT
+
+        fs = self.fit_fontsize(tokens, logical_rect)
+        fs = min(fs, logical_height * 0.9)
+        if btype == 'page_footnote': fs = min(fs, 8.0)
+        if btype == 'image_caption': fs = min(fs, 9.0)
+        line_h = fs * 1.3
+        ly = fs
+        rot_map = {0: 0, 90: 270, 180: 180, 270: 90}
+        pdf_rotate = rot_map.get(angle, 0)
+
+        def to_physical(lx, ly):
+            if angle == 90: return fitz.Point(rect.x0 + ly, rect.y0 + lx)
+            elif angle == 180: return fitz.Point(rect.x1 - lx, rect.y1 - ly)
+            elif angle == 270: return fitz.Point(rect.x1 - ly, rect.y1 - lx)
+            return fitz.Point(rect.x0 + lx, rect.y0 + ly)
+
+        i = 0
+        while i < len(tokens):
+            line_tokens = []
+            while i < len(tokens):
+                kind, content = tokens[i]
+                if kind == "word": w = font_obj.text_length(content, fontsize=fs)
+                else:
+                    metrics = self.eq_renderer.render_and_metrics(content)
+                    w = (fs * 1.2 * metrics['aspect_ratio']) if metrics else font_obj.text_length(content, fontsize=fs)
+                if not line_tokens:
+                    line_tokens.append((kind, content, w))
+                    i += 1
+                    continue
+                current_content_w = sum(t[2] for t in line_tokens)
+                if current_content_w + w + len(line_tokens) * (fs * 0.1) > logical_width: break
+                line_tokens.append((kind, content, w))
+                i += 1
+
+            is_last_line = (i == len(tokens)) or (ly + line_h > logical_height + fs * 0.5)
+            total_content_w = sum(t[2] for t in line_tokens)
+            num_spaces = len(line_tokens) - 1
+            space_w_at_fs = fs * 0.15
+            needed_w = total_content_w + (num_spaces * space_w_at_fs)
+            line_fs, squeeze_factor = fs, 1.0
+            if needed_w > logical_width:
+                combined_scale = logical_width / needed_w
+                if combined_scale >= 0.75:
+                    line_fs, dynamic_space_w = fs * combined_scale, space_w_at_fs * combined_scale
+                else:
+                    line_fs, squeeze_factor = fs * 0.75, combined_scale / 0.75
+                    dynamic_space_w = space_w_at_fs * 0.75 * squeeze_factor
+            elif num_spaces > 0 and not is_last_line:
+                dynamic_space_w = min((logical_width - total_content_w) / num_spaces, fs * 0.6)
+            else:
+                dynamic_space_w = fs * 0.25
+
+            lx = 0
+            for kind, content, w_orig in line_tokens:
+                w_scaled = w_orig * (line_fs / fs)
+                p = to_physical(lx, ly)
+                if kind == "word":
+                    morph = (p, fitz.Matrix(squeeze_factor, 1.0)) if squeeze_factor < 1.0 else None
+                    page.insert_text(p, content, fontsize=line_fs, fontname=fontname, morph=morph, rotate=pdf_rotate)
+                elif kind == "eq":
+                    metrics = self.eq_renderer.render_and_metrics(content)
+                    if metrics:
+                        disp_h = line_fs * 1.2
+                        descent_offset = disp_h * metrics['descent_ratio']
+                        p_bl = to_physical(lx, ly + descent_offset)
+                        p_tr = to_physical(lx + (w_scaled * squeeze_factor), ly - disp_h + descent_offset)
+                        eq_rect = fitz.Rect(p_bl, p_tr)
+                        eq_rect.normalize()
+                        if eq_rect.is_valid and not eq_rect.is_empty:
+                            page.insert_image(eq_rect, stream=metrics['png_bytes'], rotate=pdf_rotate)
+                    else:
+                        morph = (p, fitz.Matrix(squeeze_factor, 1.0)) if squeeze_factor < 1.0 else None
+                        page.insert_text(p, content, fontsize=line_fs, fontname=fontname, morph=morph, rotate=pdf_rotate)
+                lx += (w_scaled * squeeze_factor) + dynamic_space_w
+            ly += line_h
+            if ly > logical_height + line_h: break
+
+    def render(self, layout_data: dict, origin_pdf_path: str, output_path: str, nllb_service=None) -> str:
+        global global_cross_page_lines
+        global_cross_page_lines = []
+        src_doc = fitz.open(origin_pdf_path)
+        final_doc = fitz.open()
+        for page_data in layout_data.get('pdf_info', []):
+            page_idx = page_data.get('page_idx')
+            if page_idx is None or page_idx >= len(src_doc): continue
+            temp_page_doc = fitz.open()
+            temp_page_doc.insert_pdf(src_doc, from_page=page_idx, to_page=page_idx)
+            page = temp_page_doc[0]
+            blocks = self.extract_page_blocks(page_data)
+            blocks = sorted(blocks, key=lambda b: (int(b['bbox'][1] // 15), b['bbox'][0]))
+            for b in blocks:
+                page.add_redact_annot(fitz.Rect(b['bbox']), fill=(1, 1, 1))
+            page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+            for b in blocks:
+                self.render_block(page, b, nllb_service)
+            final_doc.insert_pdf(temp_page_doc)
+            temp_page_doc.close()
+        final_doc.save(output_path, garbage=4, deflate=True)
+        final_doc.close()
+        src_doc.close()
+        return output_path

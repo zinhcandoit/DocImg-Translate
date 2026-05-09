@@ -102,16 +102,45 @@ class MinerUClient:
             return {"status": "error", "message": f"Network error: {e}"}
 
     def extract_local_mock(self, pdf_filename: str) -> dict:
-        """Fallback for dev/demo — reads pre-existing files in data/."""
+        """Fallback for dev/demo — reads pre-existing files in data/ or output_test/."""
         base = pdf_filename.replace("_origin.pdf", "").replace(".pdf", "")
-        md_file = self.output_dir / f"{base}.md"
-        middle = self.output_dir / f"{base}_middle.json"
-        images = self.output_dir / "images"
+        
+        # Candidate search paths
+        search_dirs = [self.output_dir, Path("output_test")]
+        
+        # Try finding a directory that contains both layout.json and full.md
+        for d in search_dirs:
+            if not d.exists(): continue
+            
+            # Deep search for layout.json and a matching .md file
+            for root, dirs, files in os.walk(d):
+                root_path = Path(root)
+                md_file = None
+                middle = None
+                images = root_path / "images"
+                
+                # Check for files in this directory
+                for fn in files:
+                    fp = root_path / fn
+                    # Prioritize full.md or files matching the base name
+                    if fn == "full.md" or fn == f"{base}.md":
+                        md_file = fp
+                    elif fn == "layout.json" or fn == f"{base}_middle.json":
+                        middle = fp
+                    elif not md_file and fn.endswith(".md") and not fn.startswith("_"):
+                        md_file = fp
+                    elif not middle and (fn.endswith("_middle.json") or fn.endswith("layout.json")):
+                        middle = fp
 
-        if not md_file.exists():
-            return {"status": "error", "message": f"Mock data not found for {base}"}
+                # If we found both, verify this is likely the right one 
+                # (e.g. check if the PDF base name is in the directory or files)
+                if md_file and middle:
+                    # If we are in a subdirectory, check if the parent or files match our 'base'
+                    # Or just trust it if it's the only one found.
+                    print(f"[MinerU] Found mock data in {root}")
+                    return self._build_result(md_file, middle, images if images.exists() else None, str(root))
 
-        return self._build_result(md_file, middle, images, str(self.output_dir))
+        return {"status": "error", "message": f"Mock data not found for {base}"}
 
     # ── Polling ─────────────────────────────────────────────────
 

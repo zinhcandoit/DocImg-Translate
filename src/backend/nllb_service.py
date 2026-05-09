@@ -16,7 +16,6 @@ import torch
 import threading
 from pathlib import Path
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-from peft import PeftModel
 from html.parser import HTMLParser
 
 # ── Protection patterns for markdown translation ───────────────
@@ -37,12 +36,12 @@ PROTECTED_PATTERNS = [
 
 
 class NLLBService:
-    def __init__(self, adapter_path: str = "nllb-1.3B-final", device=None, lazy_load: bool = False):
-        self.adapter_path = adapter_path
+    def __init__(self, device=None, lazy_load: bool = False):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.loaded = False
         self.src_lang = "eng_Latn"
         self.tgt_lang = "vie_Latn"
+        self.model_name = "facebook/nllb-200-1.3B"
         self._load_event = threading.Event()
 
         if not lazy_load:
@@ -52,28 +51,16 @@ class NLLBService:
         if self.loaded:
             return
         try:
-            if not Path(self.adapter_path).exists():
-                print(f"[NLLB] Adapter not found at {self.adapter_path} — using mock mode")
-                self._load_event.set()
-                return
-            print(f"[NLLB] Loading model on {self.device}...")
+            print(f"[NLLB] Loading pretrained model {self.model_name} on {self.device}...")
             
-            # Use AutoTokenizer to handle TokenizersBackend vs NllbTokenizerFast
-            self.tokenizer = AutoTokenizer.from_pretrained(self.adapter_path, trust_remote_code=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
             
-            base = AutoModelForSeq2SeqLM.from_pretrained(
-                "facebook/nllb-200-distilled-1.3B",
+            self.model = AutoModelForSeq2SeqLM.from_pretrained(
+                self.model_name,
                 torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
                 low_cpu_mem_usage=True,
             )
 
-            # CRITICAL: Resize embeddings to match the adapter's expanded vocabulary
-            # The adapter contains 256,512 tokens (base has 256,206)
-            print(f"[NLLB] Tokenizer vocab size: {len(self.tokenizer)}. Forcing resize to 256512.")
-            base.resize_token_embeddings(256512)
-
-            # Load LoRA adapter
-            self.model = PeftModel.from_pretrained(base, self.adapter_path)
             self.model.to(self.device).eval()
             self.loaded = True
             print("[NLLB] Model loaded successfully")
@@ -94,11 +81,18 @@ class NLLBService:
             return text
         if not self.loaded:
             return f"[VI] {text}"
+        
+        # Ensure tokenizer has language codes set
+        self.tokenizer.src_lang = self.src_lang
+        self.tokenizer.tgt_lang = self.tgt_lang
+        
         inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=1024).to(self.device)
         with torch.no_grad():
+            # Use convert_tokens_to_ids to get the target language token ID
+            tgt_lang_id = self.tokenizer.convert_tokens_to_ids(self.tgt_lang)
             out = self.model.generate(
                 **inputs,
-                forced_bos_token_id=self.tokenizer.lang_code_to_id[self.tgt_lang],
+                forced_bos_token_id=tgt_lang_id,
                 max_length=1024,
             )
         return self.tokenizer.batch_decode(out, skip_special_tokens=True)[0]
@@ -287,8 +281,9 @@ class NLLBService:
         return "\n".join(translated_lines)
 
     def _protect(self, text: str) -> tuple:
+        from collections import defaultdict
         placeholders = {}
-        counts = {"CODE": 0, "MATH": 0, "INLINECODE": 0}
+        counts = defaultdict(int)
 
         all_matches = []
         for pattern, tag in PROTECTED_PATTERNS:
