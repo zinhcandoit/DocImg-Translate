@@ -336,7 +336,7 @@ def extract_page_blocks(page_data: dict) -> list[dict]:
         
         for sub in sub_blocks:
             valid_lines = []
-            
+            sub_angle = sub.get('angle', 0)
             for line in sub.get('lines', []):
                 # KIỂM TRA VẮT TRANG
                 is_cross = any(span.get('cross_page', False) for span in line.get('spans', []))
@@ -371,7 +371,8 @@ def extract_page_blocks(page_data: dict) -> list[dict]:
                         'bbox': new_bbox,
                         'type': btype,
                         'tokens': tokens,
-                        'n_lines': len(valid_bboxes)
+                        'n_lines': len(valid_bboxes),
+                        'angle': sub_angle
                     })
 
     # Đưa túi tạm vào túi toàn cục để vòng lặp trang sau lấy ra xài
@@ -385,9 +386,23 @@ def extract_page_blocks(page_data: dict) -> list[dict]:
 # -------------------------------------------------------------------
 def render_block(page: fitz.Page, block: dict, eq_renderer: EquationRenderer):
     """Render a block word-by-word with Auto-Justify Spacing and bounds clamping."""
+    # 0. Chuẩn hóa góc xoay về bội số của 90 gần nhất
+    raw_angle = block.get('angle', 0)
+    angle = int(round(raw_angle / 90) * 90) % 360
+    
     bbox = block['bbox']
     rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
-    if rect.width < 2 or rect.height < 2: return
+
+    # 1. Thiết lập không gian logic (Logical Space)
+    if angle in [90, 270]:
+        logical_width = rect.height
+        logical_height = rect.width
+    else:
+        logical_width = rect.width
+        logical_height = rect.height
+    
+    logical_rect = fitz.Rect(0, 0, logical_width, logical_height)
+    if logical_width < 2 or logical_height < 2: return
 
     tokens = block.get('tokens', [])
     if not tokens: return
@@ -397,22 +412,33 @@ def render_block(page: fitz.Page, block: dict, eq_renderer: EquationRenderer):
     fontname = TEXT_TYPE_BOLD if is_bold else TEXT_TYPE
     font_obj = FONT_BOLD if is_bold else FONT
 
-    # 1. Tìm font size và Khóa chết giới hạn
-    fs = fit_fontsize(tokens, rect, eq_renderer)
-    fs = min(fs, rect.height * 0.9) 
-    
+    # 2. Tìm font size tối ưu trong không gian logic
+    fs = fit_fontsize(tokens, logical_rect, eq_renderer)
+    fs = min(fs, logical_height * 0.9)
     if btype == 'page_footnote': fs = min(fs, 8.0)
     if btype == 'image_caption': fs = min(fs, 9.0)
 
     line_h = fs * 1.3
-    y = rect.y0 + fs 
+    ly = fs  # Tọa độ y trong không gian logic (baseline)
 
-# 2. Thuật toán Line Buffering với Ưu tiên Font Scaling (Max -25%)
+    # Bảng ánh xạ từ JSON (CCW) sang PyMuPDF (CW)
+    rot_map = {0: 0, 90: 270, 180: 180, 270: 90}
+    pdf_rotate = rot_map.get(angle, 0)
+
+    # Hàm chuyển đổi từ tọa độ Logic (lx, ly) sang tọa độ PDF vật lý
+    def to_physical(lx, ly):
+        if angle == 90:      # JSON 90: Từ Trên xuống Dưới
+            return fitz.Point(rect.x0 + ly, rect.y0 + lx)
+        elif angle == 180:   # JSON 180: Từ Phải sang Trái
+            return fitz.Point(rect.x1 - lx, rect.y1 - ly)
+        elif angle == 270:   # JSON 270: Từ Dưới lên Trên (chuẩn arXiv)
+            return fitz.Point(rect.x1 - ly, rect.y1 - lx)
+        return fitz.Point(rect.x0 + lx, rect.y0 + ly)
+
+    # 3. Thuật toán Line Buffering
     i = 0
     while i < len(tokens):
         line_tokens = []
-        
-        # --- BẮT ĐẦU GOM DÒNG VÀ QUYẾT ĐỊNH KÉO CHỮ LÊN ---
         while i < len(tokens):
             kind, content = tokens[i]
             if kind == "word":
@@ -428,86 +454,68 @@ def render_block(page: fitz.Page, block: dict, eq_renderer: EquationRenderer):
             
             current_content_w = sum(t[2] for t in line_tokens)
             new_content_w = current_content_w + w
+            current_slack = logical_width - current_content_w - (len(line_tokens) - 1) * (fs * 0.2)
             
-            # Ước tính khoảng trống để lại nếu không kéo từ này lên (dùng space chuẩn 0.2fs)
-            current_slack = rect.width - current_content_w - (len(line_tokens) - 1) * (fs * 0.2)
-            
-            # Kiểm tra xem có lố Bbox không
-            if new_content_w + len(line_tokens) * (fs * 0.1) > rect.width:
-                # Nếu lố, đo xem có đáng để "ép" để kéo chữ lên không?
-                # Chấp nhận kéo lên nếu khoảng trống để lại quá lớn (> 0.7 lần cỡ chữ)
+            if new_content_w + len(line_tokens) * (fs * 0.1) > logical_width:
                 huge_gap_if_break = current_slack > fs * 0.7
-                
-                # Tính toán xem để nhét vừa từ này thì cần tổng scale là bao nhiêu?
-                required_total_scale = rect.width / (new_content_w + len(line_tokens) * (fs * 0.05))
-                
-                # Cho phép kéo lên nếu tổng scale không quá tàn khốc (tổng hợp cả shrink và squeeze > 60%)
-                if huge_gap_if_break and required_total_scale > 0.6:
-                    pass # Đồng ý kéo từ này lên dòng hiện tại
-                else:
-                    break # Từ chối, cho xuống dòng
+                required_total_scale = logical_width / (new_content_w + len(line_tokens) * (fs * 0.05))
+                if huge_gap_if_break and required_total_scale > 0.6: pass
+                else: break
                     
             line_tokens.append((kind, content, w))
             i += 1
 
-        # 3. Tính toán Font Size và Squeeze cho dòng này
-        is_last_line = (i == len(tokens)) or (y + line_h > rect.y1 + fs * 0.5)
+        # 4. Tính toán Justify và Scaling
+        is_last_line = (i == len(tokens)) or (ly + line_h > logical_height + fs * 0.5)
         total_content_w = sum(t[2] for t in line_tokens)
         num_spaces = len(line_tokens) - 1
-        space_w_at_fs = fs * 0.15 # Khoảng trắng mặc định hẹp
-        
-        # Tổng bề ngang cần thiết tại size gốc
+        space_w_at_fs = fs * 0.15
         needed_w = total_content_w + (num_spaces * space_w_at_fs)
         
-        line_fs = fs
-        squeeze_factor = 1.0
-        
-        if needed_w > rect.width:
-            # Tỷ lệ cần giảm để vừa khít
-            combined_scale = rect.width / needed_w
-            
+        line_fs, squeeze_factor = fs, 1.0
+        if needed_w > logical_width:
+            combined_scale = logical_width / needed_w
             if combined_scale >= 0.75:
-                # CHIẾN THUẬT 1: Chỉ giảm Font Size (tối đa 25%)
                 line_fs = fs * combined_scale
                 dynamic_space_w = space_w_at_fs * combined_scale
             else:
-                # CHIẾN THUẬT 2: Giảm Font Size xuống 75% + Ép dẹp (Squeeze) phần còn lại
                 line_fs = fs * 0.75
                 squeeze_factor = combined_scale / 0.75
                 dynamic_space_w = space_w_at_fs * 0.75 * squeeze_factor
         elif num_spaces > 0 and not is_last_line:
-            # Dàn đều (Justify) nếu dòng còn trống
-            dynamic_space_w = (rect.width - total_content_w) / num_spaces
-            if dynamic_space_w > fs * 0.6: dynamic_space_w = fs * 0.6
+            dynamic_space_w = min((logical_width - total_content_w) / num_spaces, fs * 0.6)
         else:
             dynamic_space_w = fs * 0.25
 
-        # 4. Bơm mực lên PDF (Sử dụng line_fs và squeeze_factor)
-        x = rect.x0
+        # 5. Render từng từ lên PDF
+        lx = 0
         for kind, content, w_orig in line_tokens:
-            # Chiều rộng thực tế sau khi giảm font size
             w_scaled = w_orig * (line_fs / fs)
+            p = to_physical(lx, ly)
             
             if kind == "word":
-                # Morph matrix dùng để ép dẹp (squeeze) chiều ngang
-                morph = (fitz.Point(x, y), fitz.Matrix(squeeze_factor, 1.0)) if squeeze_factor < 1.0 else None
-                page.insert_text(fitz.Point(x, y), content, fontsize=line_fs, fontname=fontname, morph=morph)
+                morph = (p, fitz.Matrix(squeeze_factor, 1.0)) if squeeze_factor < 1.0 else None
+                page.insert_text(p, content, fontsize=line_fs, fontname=fontname, morph=morph, rotate=pdf_rotate)
             elif kind == "eq":
                 metrics = eq_renderer.render_and_metrics(content)
                 if metrics:
                     disp_h = line_fs * 1.2
                     descent_offset = disp_h * metrics['descent_ratio']
-                    # Squeeze ảnh bằng cách nhân squeeze_factor vào chiều rộng Rect
-                    eq_rect = fitz.Rect(x, y - disp_h + descent_offset, x + (w_scaled * squeeze_factor), y + descent_offset)
-                    page.insert_image(eq_rect, stream=metrics['png_bytes'])
+                    # Tính toán Rect vật lý cho ảnh công thức dựa trên các điểm góc logic
+                    p_bl = to_physical(lx, ly + descent_offset)
+                    p_tr = to_physical(lx + (w_scaled * squeeze_factor), ly - disp_h + descent_offset)
+                    eq_rect = fitz.Rect(p_bl, p_tr)
+                    eq_rect.normalize()
+                    if eq_rect.is_valid and not eq_rect.is_empty:
+                        page.insert_image(eq_rect, stream=metrics['png_bytes'], rotate=pdf_rotate)
                 else:
-                    # FALLBACK: Hiển thị lại chuỗi text gốc
-                    morph = (fitz.Point(x, y), fitz.Matrix(squeeze_factor, 1.0)) if squeeze_factor < 1.0 else None
-                    page.insert_text(fitz.Point(x, y), content, fontsize=line_fs, fontname=fontname, morph=morph)
-            x += (w_scaled * squeeze_factor) + dynamic_space_w
+                    morph = (p, fitz.Matrix(squeeze_factor, 1.0)) if squeeze_factor < 1.0 else None
+                    page.insert_text(p, content, fontsize=line_fs, fontname=fontname, morph=morph, rotate=pdf_rotate)
+            lx += (w_scaled * squeeze_factor) + dynamic_space_w
         
-        y += line_h
-        if y > rect.y1 + line_h: break
+        ly += line_h
+        if ly > logical_height + line_h: break
+
 
 # -------------------------------------------------------------------
 # Core Overlay Renderer
