@@ -21,36 +21,104 @@ import fitz
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-
-
 # -------------------------------------------------------------------
 # Equation Renderer: LaTeX -> PNG bytes (in-memory)
 # -------------------------------------------------------------------
 plt.rcParams.update({
-    "text.usetex": True,           # Ép dùng hệ thống LaTeX thật
-    "font.family": "serif",        # Dùng font có chân (Computer Modern mặc định của LaTeX)
-    "text.latex.preamble": r"""
-        \usepackage{amsmath}
-        \usepackage{amssymb}
-        \usepackage{bm}
-    """ # Nạp các thư viện toán học chuẩn để dịch được \begin{array}, \binom, v.v.
+    "text.usetex": False,            # TUYỆT ĐỐI KHÔNG gọi system LaTeX
+    "mathtext.fontset": "stix",      # Bật font STIX (Font khoa học siêu đẹp) CÓ SẴN trong Matplotlib
+    "font.family": "STIXGeneral",    # Font chữ thường cũng là STIX
+    "mathtext.fallback": "cm"        # Nếu thiếu symbol, tự fallback về Computer Modern
 })
 
+TEXT_TYPE = "notos"
+TEXT_TYPE_BOLD = "notosbo"
+
 class EquationRenderer:
-    """Renders LaTeX using System TeX Engine for perfect scientific layout."""
+    """Renders LaTeX internally using Matplotlib's STIX fonts, zero OS dependencies."""
     _cache: dict[str, dict] = {}
 
-    def render_and_metrics(self, latex: str, dpi: int = 300) -> dict | None: # Tăng DPI lên 300 cho nét
-        tex = latex.strip()
-        if not tex: return None
-        if tex in self._cache: return self._cache[tex]
+    def _clean_mineru_latex(self, tex: str) -> str:
+        tex = tex.strip()
+        tex = tex.replace('$', '')
+
+        # 2. Xử lý các ký tự đặc biệt của môi trường Array/Align mà Mathtext không hiểu
+        # Vì ta đã lột bỏ \begin{array}, ta phải biến & thành khoảng trắng 
+        # và \\ thành dấu ngắt quãng để tránh lỗi ParseException
+        tex = tex.replace('&', r'\quad ')
+        tex = tex.replace(r'\\', r'\quad ')
+        
+        # 1. TRIỆT TIÊU MÔI TRƯỜNG \begin{...} \end{...}
+        tex = re.sub(r'\\begin\s*\{[a-zA-Z*]+\}\s*(\{[^\}]*\})?', '', tex)
+        tex = re.sub(r'\\end\s*\{[a-zA-Z*]+\}', '', tex)
+
+        # 2. BỘ TỪ ĐIỂN CHUẨN HÓA LỆNH (Mathtext Fallback Dictionary)
+        fixes = [
+            # --- CÁC DÒNG CŨ ĐÃ CÓ ---
+            (r'\\operatorname\*', r'\\operatorname'), 
+            (r'\\dotsc|\\dotsb|\\dotsi|\\dotso', r'\\dots'), 
+            (r'\\le\b', r'\\leq'),                     
+            (r'\\ge\b', r'\\geq'),                     
+            (r'\\cal\b', r'\\mathcal'),                
+            (r'\\rm\b', r'\\mathrm'),                  
+            (r'\\bf\b', r'\\mathbf'),                  
+            (r'\\mathbbm\b', r'\\mathbb'),             
+            (r'\\stackrel', r'\\overset'),             
+            (r'\\textstyle', r''),                     
+            (r'\\displaystyle', r''),                  
+            (r'\\tag\s*\{[^\}]*\}', r''),        # Xóa lệnh \tag{...}
+            (r'\\tag\b', r''),                   # Xóa \tag lọt sổ
+            (r'\\Biggl\b|\\Biggr\b', r'\\Bigg'), # Chặt đuôi l/r của ngoặc cực lớn
+            (r'\\biggl\b|\\biggr\b', r'\\bigg'), # Chặt đuôi l/r của ngoặc lớn
+            (r'\\Bigl\b|\\Bigr\b', r'\\Big'),    # Chặt đuôi l/r của ngoặc vừa
+            (r'\\bigl\b|\\bigr\b', r'\\big'),    # Chặt đuôi l/r của ngoặc nhỏ
+        ]
+        for pattern, repl in fixes:
+            tex = re.sub(pattern, repl, tex)
+
+        # 3. CHUẨN HÓA CÚ PHÁP FONT (Trị bệnh phá ngoặc của MinerU)
+        # Sửa: { \mathcal F } hoặc \mathcal F  --->  \mathcal{F}
+        for cmd in ['mathcal', 'mathbb', 'mathbf', 'mathrm', 'mathscr', 'mathfrak']:
+            # Dạng 1: { \mathcal F }
+            tex = re.sub(r'\{\s*\\' + cmd + r'\s+([A-Za-z0-9])\s*\}', r'\\' + cmd + r'{\1}', tex)
+            # Dạng 2: \mathcal F
+            tex = re.sub(r'\\' + cmd + r'\s+([A-Za-z0-9])', r'\\' + cmd + r'{\1}', tex)
+            # Dạng 3: \mathcal { F }
+            tex = re.sub(r'\\' + cmd + r'\s*\{\s*([A-Za-z0-9])\s*\}', r'\\' + cmd + r'{\1}', tex)
+
+        tex = tex.strip()
+        
+        # 4. LỘT VỎ NGOẶC NHỌN THỪA NGOÀI CÙNG
+        # Sửa: { P = 1 } ---> P = 1
+        if tex.startswith('{') and tex.endswith('}'):
+            open_braces = 0
+            is_valid_wrap = True
+            for i, char in enumerate(tex):
+                if char == '{': open_braces += 1
+                elif char == '}': open_braces -= 1
+                # Nếu ngoặc đóng về 0 trước khi hết chuỗi -> Không phải lớp bọc ngoài cùng
+                if open_braces == 0 and i < len(tex) - 1:
+                    is_valid_wrap = False
+                    break
+            if is_valid_wrap:
+                tex = tex[1:-1].strip()
+                
+        return tex
+
+    def render_and_metrics(self, latex: str, dpi: int = 300) -> dict | None:
+        raw_tex = latex.strip()
+        if not raw_tex: return None
+        if raw_tex in self._cache: return self._cache[raw_tex]
+        
+        # Tiền xử lý LaTeX trước khi vẽ
+        clean_tex = self._clean_mineru_latex(raw_tex)
         
         try:
             fig, ax = plt.subplots(figsize=(0.01, 0.01))
             ax.axis('off')
             
-            # Gói phương trình trong thẻ math mode chuẩn
-            t = ax.text(0, 0, f"${tex}$", fontsize=40, va='baseline')
+            # Vẽ bằng engine Mathtext nội bộ (Đã ép dùng font STIX)
+            t = ax.text(0, 0, f"${clean_tex}$", fontsize=40, va='baseline')
             fig.canvas.draw()
             
             renderer = fig.canvas.get_renderer()
@@ -61,19 +129,17 @@ class EquationRenderer:
             
             fig.set_size_inches(bbox.width / dpi, bbox.height / dpi)
             buf = io.BytesIO()
-            # Dùng format 'png' hoặc 'pdf' đều được, fitz hỗ trợ insert_image từ png
             fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight', pad_inches=0, transparent=True)
             plt.close(fig)
             
-            self._cache[tex] = {
+            self._cache[raw_tex] = {
                 'png_bytes': buf.getvalue(),
                 'aspect_ratio': bbox.width / bbox.height if bbox.height > 0 else 1,
                 'descent_ratio': descent_px / bbox.height if bbox.height > 0 else 0
             }
-            return self._cache[tex]
+            return self._cache[raw_tex]
         except Exception as e:
-            # In ra lỗi để biết phương trình nào bị sai cú pháp LaTeX
-            print(f"[LaTeX Error] Failed to render: {tex[:30]}... Error: {e}")
+            print(f"[MathText Error] Failed on: {clean_tex[:30]}... | Error: {e}")
             plt.close('all')
             return None
 
@@ -118,8 +184,8 @@ def union_bbox(blocks: list[dict]) -> list | None:
 # -------------------------------------------------------------------
 # Font Fitting: binary search for optimal font size
 # -------------------------------------------------------------------
-FONT = fitz.Font("helv")
-FONT_BOLD = fitz.Font("hebo")
+FONT = fitz.Font(TEXT_TYPE)
+FONT_BOLD = fitz.Font(TEXT_TYPE_BOLD)
 SPACE_RATIO = 0.3  # space width as fraction of fontsize
 
 
@@ -160,7 +226,7 @@ def simulate_layout(tokens, rect, fontsize, eq_renderer):
     return y <= rect.y1 + 1  # 1pt tolerance
 
 
-def fit_fontsize(tokens, rect, eq_renderer, lo=3.0, hi=24.0) -> float:
+def fit_fontsize(tokens, rect, eq_renderer, lo=1.0, hi=18.0) -> float:
     """Binary search for the largest fontsize that fits tokens in rect."""
     if not tokens:
         return 10.0
@@ -221,68 +287,69 @@ def merge_blocks(blocks: list[dict], eps_y: float = 12.0, eps_x: float = 200.0) 
 # Per-Page Block Extraction
 # -------------------------------------------------------------------
 # --- 2 BIẾN TOÀN CỤC ĐỂ TRỊ BỆNH VẮT TRANG ---
-global_carry_over_blocks = []
-global_rendered_hashes = set()
+# TÚI CHỨA CÁC DÒNG VẮT TRANG
+global_cross_page_lines = []
 
 def extract_page_blocks(page_data: dict) -> list[dict]:
-    global global_carry_over_blocks
-    global global_rendered_hashes
-    
+    global global_cross_page_lines
     result = []
-    discarded_ids = {db.get('index') for db in page_data.get('discarded_blocks', []) if db.get('index') is not None}
-
-    # Lấy block của trang hiện tại + CỘNG THÊM phần bị vắt từ trang trước chuyển sang
-    raw_blocks = page_data.get('para_blocks', []) + global_carry_over_blocks
-    global_carry_over_blocks = [] # Reset giỏ chứa
     
-    for block in raw_blocks:
-        if block.get('index') in discarded_ids:
-            continue
+    # 1. ĐỔ TÚI TỪ TRANG TRƯỚC SANG TRANG HIỆN TẠI (Nếu có)
+    if global_cross_page_lines:
+        tokens = []
+        valid_bboxes = []
+        for line in global_cross_page_lines:
+            for span in line.get('spans', []):
+                stype = span.get('type', '')
+                content = span.get('content', '').strip()
+                if not content: continue
+                if stype == 'text':
+                    for w in content.split(): tokens.append(("word", w))
+                elif stype in ('inline_equation', 'interline_equation'):
+                    tokens.append(("eq", content))
+            if line.get('bbox'):
+                valid_bboxes.append(line['bbox'])
+                
+        if tokens and valid_bboxes:
+            new_bbox = [
+                min(b[0] for b in valid_bboxes), min(b[1] for b in valid_bboxes),
+                max(b[2] for b in valid_bboxes), max(b[3] for b in valid_bboxes)
+            ]
+            # Render phần vắt trang này như một block text bình thường ở đầu trang
+            result.append({
+                'bbox': new_bbox,
+                'type': 'text',
+                'tokens': tokens,
+                'n_lines': len(valid_bboxes)
+            })
+        
+        # Xóa sạch túi sau khi đã render xong ở trang mới
+        global_cross_page_lines = []
 
+    # 2. XỬ LÝ TOÀN BỘ TEXT CỦA TRANG (Cả nội dung chính lẫn Header/Footer/Page Number)
+    all_blocks = page_data.get('para_blocks', []) + page_data.get('discarded_blocks', [])
+    next_carry_over = [] # Túi tạm cho trang tiếp theo
+
+    for block in all_blocks:
         btype = block.get('type', '')
-        if btype not in ('text', 'title', 'list', 'image_caption', 'page_footnote'):
-            continue
-
-        sub_blocks = block.get('blocks', [block]) if btype in ('list', 'image') else [block]
+        sub_blocks = block.get('blocks', [block]) if 'blocks' in block else [block]
         
         for sub in sub_blocks:
-            valid_lines = []         # Phần thuộc về Trang N
-            out_of_page_lines = []   # Phần lọt của Trang N+1
-            
-            last_y = -1
-            is_carried_over = False
+            valid_lines = []
             
             for line in sub.get('lines', []):
-                l_box = line.get('bbox')
-                if not l_box: continue
+                # KIỂM TRA VẮT TRANG
+                is_cross = any(span.get('cross_page', False) for span in line.get('spans', []))
                 
-                y0 = l_box[1]
-                
-                # Băm nội dung để chống render đè 2 lần nếu MinerU lỡ duplicate block trong JSON
-                line_text = "".join(s.get('content', '') for s in line.get('spans', []))
-                if not line_text.strip(): continue
-                l_hash = f"{line_text[:15]}_{int(l_box[0])}_{int(l_box[1])}"
-                
-                if l_hash in global_rendered_hashes:
-                    continue
-                    
-                # THUẬT TOÁN CHẶN ĐỨNG VẮT TRANG (CROSS-PAGE DETECTION)
-                # Tọa độ Y bình thường luôn tăng dần (đọc từ trên xuống dưới).
-                # Nếu Y đột ngột GIẢM MẠNH (nhảy ngược lên đỉnh trang > 150px), 
-                # chắc chắn 100% dòng này đã bị vắt sang Trang N+1!
-                if last_y != -1 and y0 < last_y - 150:
-                    is_carried_over = True
-                    
-                if not is_carried_over:
-                    valid_lines.append(line)
-                    global_rendered_hashes.add(l_hash)
-                    last_y = max(last_y, y0)
+                if is_cross:
+                    next_carry_over.append(line) # Bỏ vào túi tạm, KHÔNG render ở trang này
                 else:
-                    out_of_page_lines.append(line)
+                    valid_lines.append(line)     # Giữ lại để render ở trang này
                     
-            # 1. Lắp ráp lại block CHỈ với những dòng hợp lệ của Trang N
+            # 3. TRÍCH XUẤT TOÀN BỘ CHỮ KHÔNG CHỪA LẠI GÌ CHO CÁC DÒNG HỢP LỆ
             if valid_lines:
                 tokens = []
+                valid_bboxes = []
                 for line in valid_lines:
                     for span in line.get('spans', []):
                         stype = span.get('type', '')
@@ -290,28 +357,25 @@ def extract_page_blocks(page_data: dict) -> list[dict]:
                         if not content: continue
                         if stype == 'text':
                             for w in content.split(): tokens.append(("word", w))
-                        elif stype == 'inline_equation':
+                        elif stype in ('inline_equation'):
                             tokens.append(("eq", content))
+                    if line.get('bbox'):
+                        valid_bboxes.append(line['bbox'])
                 
-                if tokens:
-                    # TÍNH LẠI BBOX CHUẨN XÁC (Tránh việc Bbox vắt trang bóp nghẹt text)
-                    bboxes = [l['bbox'] for l in valid_lines]
+                if tokens and valid_bboxes:
                     new_bbox = [
-                        min(b[0] for b in bboxes), min(b[1] for b in bboxes),
-                        max(b[2] for b in bboxes), max(b[3] for b in bboxes)
+                        min(b[0] for b in valid_bboxes), min(b[1] for b in valid_bboxes),
+                        max(b[2] for b in valid_bboxes), max(b[3] for b in valid_bboxes)
                     ]
                     result.append({
                         'bbox': new_bbox,
                         'type': btype,
                         'tokens': tokens,
-                        'n_lines': len(valid_lines)
+                        'n_lines': len(valid_bboxes)
                     })
-                    
-            # 2. CẦM NHỮNG DÒNG CỦA TRANG N+1 QUĂNG SANG VÒNG LẶP SAU
-            if out_of_page_lines:
-                carry_sub = sub.copy()
-                carry_sub['lines'] = out_of_page_lines
-                global_carry_over_blocks.append(carry_sub)
+
+    # Đưa túi tạm vào túi toàn cục để vòng lặp trang sau lấy ra xài
+    global_cross_page_lines.extend(next_carry_over)
                 
     return result
 
@@ -330,7 +394,7 @@ def render_block(page: fitz.Page, block: dict, eq_renderer: EquationRenderer):
 
     btype = block['type']
     is_bold = btype == 'title'
-    fontname = "hebo" if is_bold else "helv"
+    fontname = TEXT_TYPE_BOLD if is_bold else TEXT_TYPE
     font_obj = FONT_BOLD if is_bold else FONT
 
     # 1. Tìm font size và Khóa chết giới hạn
@@ -457,6 +521,8 @@ class OverlayRenderer:
         self.eq_renderer = EquationRenderer()
         
     def process_pipeline(self):
+        global global_cross_page_lines
+        global_cross_page_lines = []
         # 1. Mở file gốc chỉ để đọc
         src_doc = fitz.open(self.origin_pdf)
         print(f"[V8-ISOLATED] Processing {len(src_doc)} pages independently...")
@@ -519,9 +585,9 @@ class OverlayRenderer:
 # Main
 # -------------------------------------------------------------------
 def main():
-    input_dir = Path('data')
-    layout_path = input_dir / '23-025_layout.json'
-    origin_pdf = input_dir / '23-025_origin.pdf'
+    input_dir = Path('output_test/957775a3-7aa9-46aa-a8c3-6017ff6ec536')
+    layout_path = input_dir / 'layout.json'
+    origin_pdf = input_dir / '1fe4b827-34d4-4f76-a343-81e3da8727b2_origin.pdf'
     output_path = Path('scratch/rendered_overlay.pdf')
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
