@@ -170,7 +170,7 @@ if st.session_state.translated_markdown:
             st.info("Click 'Run Agent Analysis' in the sidebar to see results.")
 
     with tab4:
-        st.subheader("📥 Download Outputs")
+        st.subheader("📥 Download & Preview")
 
         # Download translated markdown
         if st.session_state.translated_markdown:
@@ -181,20 +181,34 @@ if st.session_state.translated_markdown:
                 mime="text/markdown",
             )
 
-        # Download translated PDF
+        # Download/Preview translated PDF
         if st.session_state.pdf_ready and st.session_state.doc_id:
             try:
-                pdf_res = requests.get(f"{API_BASE}/download/{st.session_state.doc_id}")
+                # PDF Preview logic
+                pdf_res = requests.get(f"{API_BASE}/stream-pdf/{st.session_state.doc_id}")
                 if pdf_res.status_code == 200:
+                    import base64
+                    pdf_bytes = pdf_res.content
+                    
+                    st.divider()
+                    st.subheader("👁️ PDF Preview")
+                    
+                    # Encode to base64 for embedding
+                    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
+                    st.markdown(pdf_display, unsafe_allow_html=True)
+                    
+                    st.divider()
                     st.download_button(
-                        "📕 Download Translated PDF",
-                        pdf_res.content,
-                        file_name="translated.pdf",
+                        "💾 Save Translated PDF",
+                        pdf_bytes,
+                        file_name=f"{st.session_state.doc_id}_translated.pdf",
                         mime="application/pdf",
+                        use_container_width=True
                     )
                 else:
-                    st.warning("PDF not ready yet")
+                    st.warning("PDF stream not available")
             except Exception as e:
-                st.error(f"PDF download error: {e}")
+                st.error(f"PDF preview error: {e}")
         else:
             st.info("PDF will be available after conversion with middle.json data")
