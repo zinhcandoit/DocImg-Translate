@@ -1,3 +1,13 @@
+---
+title: DIMT - Document Intelligent Machine Translation
+emoji: 📄
+colorFrom: blue
+colorTo: green
+sdk: streamlit
+sdk_version: 1.57.0
+app_file: src/frontend/app.py
+pinned: false
+---
 # DIMT — Document Intelligent Machine Translation
 
 > Production pipeline for translating academic PDF documents (English → Vietnamese) with layout-preserving PDF reconstruction.
