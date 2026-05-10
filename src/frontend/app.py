@@ -9,13 +9,38 @@ Features:
 - User feedback with MLflow metrics logging
 """
 
+import subprocess
+import sys
+import time
 import streamlit as st
 import requests
-import time
 
 st.set_page_config(layout="wide", page_title="DIMT — Document Translation", page_icon="📄")
 
 API_BASE = "http://localhost:8000"
+
+
+# ── Backend startup (HF Spaces: only one process allowed) ───
+@st.cache_resource
+def start_backend():
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn",
+         "src.backend.api:app", "--host", "0.0.0.0", "--port", "8000"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    # Poll until backend is up (max 180s for NLLB to load)
+    for _ in range(180):
+        try:
+            requests.get(f"{API_BASE}/docs", timeout=1)
+            return proc
+        except Exception:
+            time.sleep(1)
+    return proc  # return anyway, let requests fail naturally
+
+start_backend()
+
+# ── rest of file unchanged below ────────────────────────────
 
 st.title("📄 Document Intelligent Machine Translation")
 st.caption("PDF → MinerU extraction → NLLB translation → Translated PDF + Markdown")
@@ -184,20 +209,18 @@ if st.session_state.translated_markdown:
         # Download/Preview translated PDF
         if st.session_state.pdf_ready and st.session_state.doc_id:
             try:
-                # PDF Preview logic
                 pdf_res = requests.get(f"{API_BASE}/stream-pdf/{st.session_state.doc_id}")
                 if pdf_res.status_code == 200:
                     import base64
                     pdf_bytes = pdf_res.content
-                    
+
                     st.divider()
                     st.subheader("👁️ PDF Preview")
-                    
-                    # Encode to base64 for embedding
+
                     base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
                     pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
                     st.markdown(pdf_display, unsafe_allow_html=True)
-                    
+
                     st.divider()
                     st.download_button(
                         "💾 Save Translated PDF",
