@@ -132,7 +132,7 @@ class AgenticLayoutClassifier:
             try:
                 self.client.http_options = types.HttpOptions(timeout=600_000)
                 config = types.GenerateContentConfig(
-                    thinking_config=types.ThinkingConfig(thinking_level="HIGH"),
+                    thinking_config=types.ThinkingConfig(thinking_level="LOW"),
                     tools=[types.Tool(google_search=types.GoogleSearch())]
                 )
                 response = self.client.models.generate_content(model=self.model, contents=prompt, config=config)

@@ -135,10 +135,15 @@ class MinerUClient:
                 # If we found both, verify this is likely the right one 
                 # (e.g. check if the PDF base name is in the directory or files)
                 if md_file and middle:
-                    # If we are in a subdirectory, check if the parent or files match our 'base'
-                    # Or just trust it if it's the only one found.
-                    print(f"[MinerU] Found mock data in {root}")
-                    return self._build_result(md_file, middle, images if images.exists() else None, str(root))
+                    is_match = (
+                        base in root_path.name or
+                        base in md_file.name or
+                        base in middle.name
+                    )
+                    
+                    if is_match:
+                        print(f"[MinerU] Found mock data for {base} in {root}")
+                        return self._build_result(md_file, middle, images if images.exists() else None, str(root))
 
         return {"status": "error", "message": f"Mock data not found for {base}"}
 

@@ -85,10 +85,8 @@ async def upload_file(file: UploadFile):
     content = await file.read()
     save_path.write_bytes(content)
 
-    # Try mock first (for demo with pre-existing data), else real API
-    res = mineru.extract_local_mock(file.filename)
-    if res["status"] != "success":
-        res = mineru.extract_from_file(str(save_path))
+    # Call real MinerU API for all uploaded documents
+    res = mineru.extract_from_file(str(save_path))
 
     if res["status"] == "success":
         doc_store[doc_id] = {

@@ -44,8 +44,7 @@ with st.sidebar:
     agent_btn = st.button("Run Agent Analysis", use_container_width=True)
 
 if clear_btn:
-    for key in st.session_state:
-        st.session_state[key] = None
+    st.session_state.clear()
     st.rerun()
 
 # ── Pipeline Execution ─────────────────────────────────────
