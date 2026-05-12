@@ -13,11 +13,14 @@ Roles:
 import os
 import re
 import json
+import uuid
 import numpy as np
-from pathlib import Path
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
+from sqlalchemy.orm import Session
+
+from .database import EvalRun, EvalCase, EvalKeyword
 
 load_dotenv()
 
@@ -29,10 +32,8 @@ WIKI_TEMPLATES = {
 
 
 class AIAgent:
-    def __init__(self, memory_dir: str = "local_memory", target_lang: str = "vie_Latn"):
-        self.memory_dir = Path(memory_dir)
-        self.memory_dir.mkdir(exist_ok=True)
-        self.memory_file = self.memory_dir / "long_term_memory.json"
+    def __init__(self, db_session: Session, target_lang: str = "vie_Latn"):
+        self.db = db_session
         self.target_lang = target_lang
 
         api_key = os.environ.get("GEMMA_4_API_KEY", os.environ.get("GOOGLE_API_KEY"))
@@ -83,7 +84,6 @@ Only output the JSON array, no markdown fences."""
                         "score": span["score"],
                         "bbox": span.get("bbox"),
                     })
-        # Recurse into nested blocks (tables, lists)
         for sub in block.get("blocks", []):
             self._collect_from_block(sub, page_idx, results)
 
@@ -105,7 +105,6 @@ Only output the JSON array, no markdown fences."""
         threshold = max(s["score"] for s in q4)
 
         if not self.llm:
-            # Mock verification
             results = [
                 {"index": i, "content": s["content"][:50], "score": s["score"],
                  "verdict": "REVIEW" if s["score"] < 0.5 else "OK",
@@ -114,7 +113,6 @@ Only output the JSON array, no markdown fences."""
             ]
             return {"q4_count": len(q4), "threshold": threshold, "results": results}
 
-        # LLM verification (batch in groups of 20)
         all_results = []
         for batch_start in range(0, min(len(q4), 40), 20):
             batch = q4[batch_start:batch_start + 20]
@@ -128,8 +126,7 @@ Only output the JSON array, no markdown fences."""
                 if content.startswith("```"):
                     content = re.sub(r"^```\w*\n?", "", content)
                     content = re.sub(r"\n?```$", "", content)
-                parsed = json.loads(content)
-                all_results.extend(parsed)
+                all_results.extend(json.loads(content))
             except Exception as e:
                 print(f"[Agent] Verification error: {e}")
                 all_results.extend([
@@ -138,7 +135,6 @@ Only output the JSON array, no markdown fences."""
                     for i, s in enumerate(batch, start=batch_start)
                 ])
 
-        self._save_memory({"action": "q4_verify", "count": len(q4), "results": all_results})
         return {"q4_count": len(q4), "threshold": threshold, "results": all_results}
 
     # ── Keyword Extraction & WikiSearch ─────────────────────────
@@ -147,7 +143,6 @@ Only output the JSON array, no markdown fences."""
         """Extract keywords from the paper's Abstract section or full scan."""
         keywords = []
 
-        # Strategy 1: find explicit "Keywords:" line
         kw_match = re.search(
             r"(?:Keywords?|Key\s*words?)\s*[:：]\s*(.+?)(?:\n\n|\n##|\n#|\Z)",
             markdown,
@@ -155,63 +150,56 @@ Only output the JSON array, no markdown fences."""
         )
         if kw_match:
             raw = kw_match.group(1).strip()
-            # Split by comma, semicolon, or period-separated
             parts = re.split(r"[,;]\s*", raw)
             keywords = [p.strip().rstrip(".") for p in parts if p.strip() and len(p.strip()) > 2]
 
-        if not keywords:
-            # Strategy 2: use LLM to extract if available
-            if self.llm:
-                try:
-                    resp = self.llm.invoke(
-                        f"Extract the main technical keywords from this research paper abstract. "
-                        f"Return ONLY a JSON array of strings.\n\n{markdown[:3000]}"
-                    )
-                    content = resp.content.strip()
-                    if content.startswith("```"):
-                        content = re.sub(r"^```\w*\n?", "", content)
-                        content = re.sub(r"\n?```$", "", content)
-                    keywords = json.loads(content)
-                except Exception:
-                    pass
+        if not keywords and self.llm:
+            try:
+                resp = self.llm.invoke(
+                    f"Extract the main technical keywords from this research paper abstract. "
+                    f"Return ONLY a JSON array of strings.\n\n{markdown[:3000]}"
+                )
+                content = resp.content.strip()
+                if content.startswith("```"):
+                    content = re.sub(r"^```\w*\n?", "", content)
+                    content = re.sub(r"\n?```$", "", content)
+                keywords = json.loads(content)
+            except Exception:
+                pass
 
-        return keywords[:15]  # Cap at 15
+        return keywords[:15]
 
     def get_keyword_wiki_urls(self, keywords: list) -> list:
         """Generate Wikipedia URLs for keywords in target language."""
         template = WIKI_TEMPLATES.get(self.target_lang, WIKI_TEMPLATES["eng_Latn"])
-        results = []
-        for kw in keywords:
-            # Wikipedia uses underscores for spaces
-            wiki_title = kw.strip().replace(" ", "_")
-            url = template.format(wiki_title)
-            results.append({"keyword": kw, "url": url})
-        return results
+        return [
+            {"keyword": kw, "url": template.format(kw.strip().replace(" ", "_"))}
+            for kw in keywords
+        ]
+
+    # ── DB persistence ──────────────────────────────────────────
+
+    def _save_keywords_to_db(self, run_id: str, wiki_urls: list):
+        for item in wiki_urls:
+            self.db.add(EvalKeyword(
+                id=str(uuid.uuid4()),
+                run_id=run_id,
+                keyword=item["keyword"],
+                wiki_url=item["url"],
+            ))
+        self.db.commit()
 
     # ── Combined Agent Run ──────────────────────────────────────
 
-    def run(self, middle_data: dict, markdown: str) -> dict:
+    def run(self, middle_data: dict, markdown: str, doc_id: str, pdf_name: str) -> dict:
         """Full agent run: Q4 verify + keywords + WikiSearch."""
         q4_result = self.verify_q4_elements(middle_data)
         keywords = self.extract_keywords(markdown)
         wiki_urls = self.get_keyword_wiki_urls(keywords)
+        self._save_keywords_to_db(doc_id, wiki_urls)
 
-        result = {
+        return {
             "q4_verification": q4_result,
             "keywords": keywords,
             "wiki_references": wiki_urls,
         }
-        self._save_memory(result)
-        return result
-
-    # ── Memory ──────────────────────────────────────────────────
-
-    def _save_memory(self, item: dict):
-        memory = []
-        if self.memory_file.exists():
-            try:
-                memory = json.loads(self.memory_file.read_text())
-            except json.JSONDecodeError:
-                pass
-        memory.append(item)
-        self.memory_file.write_text(json.dumps(memory, indent=2, ensure_ascii=False))
