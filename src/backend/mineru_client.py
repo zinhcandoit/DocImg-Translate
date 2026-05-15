@@ -23,6 +23,7 @@ import zipfile
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 load_dotenv()
 
@@ -45,6 +46,12 @@ class MinerUClient:
 
     # ── Public API ──────────────────────────────────────────────
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=60),
+        retry=retry_if_exception_type(requests.exceptions.RequestException),
+        reraise=True,
+    )
     def extract_from_file(self, file_path: str, model_version: str = "vlm") -> dict:
         """Upload a local file via signed-URL flow and extract."""
         file_path = Path(file_path)
@@ -63,6 +70,9 @@ class MinerUClient:
                 json=data,
                 timeout=30,
             )
+            if res.status_code == 429:
+                print("[MinerU] Rate limit hit (429). Retrying...")
+                raise requests.exceptions.RequestException("Rate limit exceeded")
             res.raise_for_status()
             result = res.json()
             if result.get("code") != 0:
