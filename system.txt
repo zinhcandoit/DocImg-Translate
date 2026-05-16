@@ -1,0 +1,557 @@
+# Kiến trúc tổng thể của hệ thống Document Intelligent Machine Translation Pipeline
+
+Hệ thống **Document Intelligent Machine Translation Pipeline** là một pipeline dịch tài liệu thông minh được thiết kế nhằm xử lý các tài liệu học thuật, kỹ thuật và nghiên cứu có cấu trúc phức tạp như PDF khoa học, báo cáo kỹ thuật hoặc tài liệu chứa công thức toán học, bảng biểu và hình minh họa.
+
+Mục tiêu chính của hệ thống là:
+
+* Dịch tài liệu với chất lượng ngữ nghĩa cao
+* Giữ nguyên bố cục và định dạng gốc
+* Hỗ trợ công thức toán học và bảng biểu
+* Tự động sửa lỗi OCR bằng AI
+* Tối ưu chi phí xử lý thông qua cơ chế cache và database
+* Tăng cường trải nghiệm đọc bằng liên kết tri thức học thuật
+
+Toàn bộ pipeline được chia thành nhiều giai đoạn liên tiếp, từ tiếp nhận tài liệu, trích xuất nội dung, dịch thuật, tái dựng PDF cho đến hậu kiểm bằng AI Agent.
+
+---
+
+# STEP 0 — Deduplication & Database Gatekeeper
+
+Đây là lớp “cổng kiểm tra” đầu tiên của toàn hệ thống.
+Mục tiêu của bước này là tránh xử lý lại những tài liệu đã từng được dịch trước đó nhằm tiết kiệm tài nguyên GPU, thời gian và chi phí API.
+
+## 1. Tạo mã định danh tài liệu
+
+Ngay khi người dùng tải file lên, hệ thống sẽ tính toán mã băm SHA-256 dựa trên toàn bộ nội dung nhị phân của file:
+
+```text
+SHA-256(file_binary_content)
+```
+
+Mã hash này đóng vai trò như:
+
+* ID duy nhất của tài liệu
+* Khóa tra cứu trong database
+* Cơ chế chống xử lý trùng lặp
+
+---
+
+## 2. Kiểm tra Database
+
+Hệ thống truy vấn database (ví dụ PostgreSQL + pgvector) để kiểm tra xem tài liệu này đã từng được xử lý hay chưa.
+
+Database lưu:
+
+* layout.json
+* document.md
+* dữ liệu dịch
+* metadata
+* thông tin WikiSearch
+* file PDF đã render
+
+---
+
+## 3. Phân nhánh xử lý
+
+### Trường hợp 1 — File đã tồn tại
+
+Nếu hash đã có trong database:
+
+Hệ thống sẽ:
+
+* tải lại layout
+* tải bản dịch
+* tải metadata
+* bỏ qua hoàn toàn bước OCR và dịch thuật
+
+Sau đó chuyển thẳng sang bước render PDF.
+
+Điều này giúp:
+
+* giảm gần như 100% chi phí inference
+* tăng tốc độ phản hồi
+* đảm bảo tính nhất quán giữa các lần dịch
+
+---
+
+### Trường hợp 2 — File hoàn toàn mới
+
+Nếu hash chưa tồn tại:
+
+* tạo session_id mới
+* tạo workspace tạm
+* chuyển sang STEP 1
+
+---
+
+# STEP 1 — PDF Extraction
+
+Đây là giai đoạn bóc tách tài liệu thành dữ liệu mà AI có thể hiểu và xử lý.
+
+Pipeline ưu tiên sử dụng:
+
+* MinerU Precision API
+
+Fallback:
+
+* Nougat model
+* dữ liệu mock cục bộ
+
+---
+
+# 1. Upload tài liệu đến MinerU
+
+PDF được gửi lên endpoint:
+
+```text
+POST /api/v4/file-urls/batch
+```
+
+MinerU sẽ thực hiện:
+
+* OCR
+* phân tích layout
+* nhận diện bảng
+* nhận diện công thức toán
+* trích xuất markdown
+
+---
+
+# 2. Async Polling
+
+Do quá trình xử lý diễn ra bất đồng bộ nên hệ thống sẽ polling liên tục:
+
+```json
+{
+  "state": "processing"
+}
+```
+
+Cho đến khi:
+
+```json
+{
+  "state": "done"
+}
+```
+
+---
+
+# 3. Kết quả trả về
+
+Sau khi hoàn tất, MinerU trả về file ZIP chứa:
+
+```text
+output.zip
+├── document.md
+├── layout.json
+├── images/
+│   ├── eq_001.png
+│   ├── eq_002.png
+│   └── ...
+```
+
+---
+
+# 4. Ý nghĩa từng thành phần
+
+## document.md
+
+Đây là phiên bản markdown tuyến tính của toàn bộ tài liệu.
+
+Nó chứa:
+
+* tiêu đề
+* đoạn văn
+* bảng HTML
+* caption
+* placeholder công thức
+
+File này được dùng làm:
+
+* ngữ cảnh đọc hiểu cho LLM
+* đầu vào chính cho translation model
+
+---
+
+## layout.json
+
+Đây là file quan trọng nhất của pipeline.
+
+Nó chứa:
+
+* bounding box
+* loại block
+* số trang
+* điểm confidence OCR
+* merge_prev flag
+* nội dung text
+
+Ví dụ:
+
+```json
+{
+  "type": "text",
+  "bbox": [120, 340, 580, 390],
+  "page": 3,
+  "score": 0.91,
+  "merge_prev": false,
+  "content": "Transformer architectures..."
+}
+```
+
+---
+
+## images/
+
+Chứa ảnh render của công thức toán học.
+
+Ví dụ:
+
+```text
+eq_001.png
+```
+
+Hệ thống không render lại công thức từ LaTeX mà dùng chính ảnh này để:
+
+* tránh sai lệch công thức
+* giữ nguyên hình thức khoa học
+* đảm bảo fidelity
+
+---
+
+# STEP 2 — Translation Engine
+
+Đây là trái tim của hệ thống dịch thuật.
+
+Pipeline hỗ trợ:
+
+* NLLB-1.3B + LoRA
+* Vary-base + LoRA
+
+---
+
+# 1. Dịch theo Paragraph thay vì từng dòng
+
+Hệ thống không dịch line-by-line vì:
+
+* dễ mất ngữ cảnh
+* câu văn bị đứt đoạn
+* thuật ngữ thiếu nhất quán
+
+Thay vào đó:
+
+* layout.json sẽ được gom thành para_blocks
+* các block có merge_prev=true sẽ được nối lại
+* toàn paragraph được dịch trong một lần inference
+
+Điều này giúp:
+
+* văn phong mượt hơn
+* ngữ nghĩa chính xác hơn
+* giữ tính học thuật
+
+---
+
+# 2. Bảo vệ công thức toán học
+
+Các inline equation sẽ được thay bằng placeholder tạm thời:
+
+```text
+Einstein proved [EQ_1] under...
+```
+
+Trong đó:
+
+```text
+[EQ_1] = phương trình gốc
+```
+
+Mục đích:
+
+* tránh model dịch nhầm công thức
+* bảo toàn ký hiệu toán học
+* tránh token corruption
+
+Sau khi dịch xong:
+
+* hệ thống restore equation vào đúng vị trí
+
+---
+
+# 3. Xử lý bảng biểu
+
+Các bảng HTML được tách riêng.
+
+Ví dụ:
+
+```html
+<table>
+<tr><td>Accuracy</td><td>95%</td></tr>
+</table>
+```
+
+Pipeline sẽ:
+
+1. parse từng cell
+2. dịch riêng từng ô
+3. giữ nguyên cấu trúc hàng/cột
+4. reconstruct bảng sau dịch
+
+Kết quả:
+
+```html
+<table>
+<tr><td>Độ chính xác</td><td>95%</td></tr>
+</table>
+```
+
+---
+
+# STEP 3 — PDF Reconstruction
+
+Sau khi dịch xong, hệ thống cần tái dựng lại tài liệu với bố cục gần giống bản gốc nhất có thể.
+
+Công cụ chính:
+
+* PyMuPDF
+
+Có thể bổ sung:
+
+* ReportLab
+* WeasyPrint
+
+---
+
+# 1. Giữ nguyên kích thước trang
+
+Hệ thống đọc:
+
+* page size
+* margin
+* bounding boxes
+
+Từ layout.json để tái tạo:
+
+* vị trí text
+* alignment
+* flow
+
+---
+
+# 2. Render text dịch
+
+Text tiếng đích được đặt vào đúng bounding box cũ.
+
+Pipeline hỗ trợ:
+
+* auto line wrapping
+* font scaling
+* overflow handling
+
+---
+
+# 3. Render công thức toán học
+
+Đây là điểm đặc biệt của hệ thống.
+
+Thay vì:
+
+* render lại LaTeX
+
+Pipeline sử dụng:
+
+* trực tiếp ảnh PNG trong images/
+
+Điều này giúp:
+
+* công thức giống hệt bản gốc
+* không bị lỗi font toán
+* không lệch format học thuật
+
+---
+
+# 4. Render bảng biểu
+
+Bảng được xử lý đặc biệt:
+
+* dựng lại grid
+* render text từng cell
+* căn chỉnh theo layout gốc
+
+---
+
+# 5. Hỗ trợ Unicode và dấu tiếng Việt
+
+Pipeline dùng system TrueType fonts:
+
+* Noto Sans
+* Arial Unicode
+* Times New Roman
+* Source Han Sans
+
+Nhờ đó hỗ trợ:
+
+* tiếng Việt
+* tiếng Nhật
+* tiếng Trung
+* tiếng Ả Rập
+* Cyrillic
+
+---
+
+# STEP 4 — AI Agent Layer (Gemma-4-31B-it)
+
+Đây là lớp AI hậu kiểm và tăng cường chất lượng.
+
+Các agent hoạt động độc lập hoặc song song.
+
+---
+
+# 1. Q4 Verification Agent
+
+Agent này chuyên sửa lỗi OCR.
+
+## Cách hoạt động
+
+Từ layout.json:
+
+* lấy toàn bộ score OCR
+* tính percentile 25%
+
+Các block có:
+
+```text
+score < Q1
+```
+
+được xem là vùng OCR kém tin cậy.
+
+---
+
+## Quy trình sửa lỗi
+
+Agent sẽ:
+
+1. crop vùng ảnh gốc
+2. gửi image + OCR text cho Gemma
+3. AI đối chiếu và sửa lỗi
+
+Ví dụ:
+
+* β bị nhận thành B
+* ∑ bị nhận thành E
+
+Đặc biệt hữu ích cho:
+
+* công thức toán
+* ký hiệu Hy Lạp
+* tài liệu scan chất lượng thấp
+
+---
+
+# 2. Keyword Extraction Agent
+
+Agent này đọc:
+
+* Abstract
+* mục Keywords
+
+để trích xuất từ khóa học thuật.
+
+Ví dụ:
+
+```json
+[
+  "Transformer",
+  "Machine Translation",
+  "Attention Mechanism"
+]
+```
+
+---
+
+# 3. WikiSearch Agent
+
+Sau khi có keyword:
+
+* hệ thống tìm link học thuật tương ứng
+
+Nguồn ưu tiên:
+
+1. Wikipedia
+2. arXiv
+3. ACL Anthology
+4. Semantic Scholar
+5. DOI
+
+Metadata được lưu lại để:
+
+* tăng trải nghiệm đọc
+* hỗ trợ tra cứu thuật ngữ
+* tạo semantic metadata
+
+---
+
+# 4. Table Recovery Agent
+
+Agent này chuyên phát hiện:
+
+* cell chưa dịch
+* caption bị sót
+* graph label chưa translate
+
+Nó sẽ:
+
+1. đối chiếu layout tree
+2. tìm vùng thiếu
+3. gom context lân cận
+4. dịch bổ sung
+5. patch lại output
+
+---
+
+# Database Persistence & Export
+
+Sau khi pipeline hoàn tất, toàn bộ dữ liệu sẽ được lưu lại.
+
+Bao gồm:
+
+* SHA-256 hash
+* layout.json
+* markdown
+* bilingual mapping
+* equation images
+* translated PDF
+* metadata
+
+Điều này giúp:
+
+* tái sử dụng bản dịch
+* cache thông minh
+* regenerate nhanh chóng
+
+---
+
+# Tổng kết
+
+Pipeline này không đơn thuần là một hệ thống OCR + dịch thuật thông thường, mà là một kiến trúc AI đa tầng chuyên xử lý tài liệu học thuật và kỹ thuật với độ chính xác cao.
+
+Các đặc điểm nổi bật gồm:
+
+* Dịch theo ngữ cảnh paragraph
+* Giữ nguyên layout PDF
+* Bảo toàn công thức toán học
+* Hậu kiểm OCR bằng Vision-LLM
+* Tự động sửa thiếu sót trong bảng biểu
+* Hệ thống cache chống dịch lặp
+* Tích hợp semantic knowledge augmentation
+
+Nhờ sự kết hợp giữa:
+
+* OCR engine
+* Translation model
+* Layout reconstruction
+* AI Agent verification
+
+hệ thống có thể tạo ra các bản dịch PDF có chất lượng gần với tài liệu biên tập thủ công trong khi vẫn giữ được tốc độ và khả năng mở rộng của một pipeline AI tự động.
