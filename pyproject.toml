@@ -28,6 +28,7 @@ dependencies = [
     "google-genai>=0.3.0",
     "scikit-learn>=1.5.0",
     "typst>=0.11.0",
+    "pymupdf-fonts>=1.0.5",
 ]
 
 [tool.uv.sources]

@@ -3,11 +3,14 @@ AI Agent — Q4 score verification, keyword extraction, WikiSearch URLs.
 
 Roles:
 1. Verify extracted elements from Q4 (bottom 25th percentile) of "score"
-   in middle.json spans. Flag low-confidence OCR/equation extractions.
+   in layout.json spans. Flag low-confidence OCR/equation extractions.
 2. Extract keywords from the .md file (from Abstract Keywords line or
    full content scan) and present WikiSearch URLs in target language.
 3. Translate skipped translatable elements (e.g. table cell text that
    the main pipeline might miss).
+
+LLM: deepseek-ai/deepseek-v4-flash via NVIDIA API (langchain_openai)
+     or gemini-2.5-flash via Google API (langchain_google_genai)
 """
 
 import os
@@ -15,38 +18,62 @@ import re
 import json
 import uuid
 import numpy as np
+import time
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import PromptTemplate
-from sqlalchemy.orm import Session
 
-from .database import EvalRun, EvalCase, EvalKeyword
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import PromptTemplate
+
+from .database import EvalKeyword
 
 load_dotenv()
 
-# Wikipedia URL template per language
-WIKI_TEMPLATES = {
-    "vie_Latn": "https://vi.wikipedia.org/wiki/{}",
-    "eng_Latn": "https://en.wikipedia.org/wiki/{}",
-}
 
+
+
+# =====================================================================
+# MAIN MODULE: AGENT
+# =====================================================================
 
 class AIAgent:
-    def __init__(self, db_session: Session, target_lang: str = "vie_Latn"):
+    SUPPORTED_PROVIDERS = ["deepseek", "gemini"]
+
+    def __init__(self, target_lang: str = "fra_Latn", db_session=None,
+                 llm_provider: str = "deepseek"):
         self.db = db_session
         self.target_lang = target_lang
+        self.llm_provider = llm_provider
+        self.set_llm_provider(llm_provider)
 
-        api_key = os.environ.get("GEMMA_4_API_KEY", os.environ.get("GOOGLE_API_KEY"))
-        if api_key:
-            os.environ["GOOGLE_API_KEY"] = api_key
+    def _get_text_content(self, message) -> str:
+        content = message.content
+        if isinstance(content, list):
+            # Trích xuất text từ các content parts
+            return "".join([part.get("text", "") if isinstance(part, dict) else str(part) for part in content])
+        return str(content)
 
+    def set_llm_provider(self, provider: str):
+        """Switch LLM backend between deepseek and gemini."""
+        self.llm_provider = provider
         try:
-            self.llm = ChatGoogleGenerativeAI(
-                model="gemma-4-31b-it",
-                temperature=0.0,
-            )
+            if provider == "gemini":
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                self.llm = ChatGoogleGenerativeAI(
+                    model="gemini-flash-lite-latest",
+                    google_api_key=os.environ.get("GEMINI_API_KEY", ""),
+                    temperature=0.0,
+                )
+                print(f"[Agent] LLM set to Gemini 2.5 Flash")
+            else:
+                self.llm = ChatOpenAI(
+                    base_url="https://integrate.api.nvidia.com/v1",
+                    api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+                    model="deepseek-ai/deepseek-v4-flash",
+                    temperature=0.0,
+                )
+                print(f"[Agent] LLM set to DeepSeek V4 Flash")
         except Exception as e:
-            print(f"[Agent] LLM init failed: {e}")
+            print(f"[Agent] LLM init failed ({provider}): {e}")
             self.llm = None
 
         self.verify_prompt = PromptTemplate(
@@ -64,10 +91,9 @@ Only output the JSON array, no markdown fences."""
 
     # ── Q4 Score Verification ───────────────────────────────────
 
-    def collect_scores(self, middle_data: dict) -> list:
-        """Collect all spans with scores from middle.json."""
+    def collect_scores(self, layout_data: dict) -> list:
         spans_with_scores = []
-        for page in middle_data.get("pdf_info", []):
+        for page in layout_data.get("pdf_info", []):
             page_idx = page.get("page_idx", 0)
             for block in page.get("para_blocks", page.get("preproc_blocks", [])):
                 self._collect_from_block(block, page_idx, spans_with_scores)
@@ -87,31 +113,22 @@ Only output the JSON array, no markdown fences."""
         for sub in block.get("blocks", []):
             self._collect_from_block(sub, page_idx, results)
 
-    def get_q4_elements(self, middle_data: dict) -> list:
-        """Return spans in the bottom 25th percentile (Q4) of scores."""
-        all_spans = self.collect_scores(middle_data)
+    def get_q4_elements(self, layout_data: dict) -> list:
+        all_spans = self.collect_scores(layout_data)
         if not all_spans:
             return []
         scores = [s["score"] for s in all_spans]
         q1_threshold = float(np.percentile(scores, 25))
         return [s for s in all_spans if s["score"] <= q1_threshold]
 
-    def verify_q4_elements(self, middle_data: dict) -> dict:
-        """Use LLM to verify low-score elements."""
-        q4 = self.get_q4_elements(middle_data)
+    def verify_q4_elements(self, layout_data: dict) -> dict:
+        q4 = self.get_q4_elements(layout_data)
         if not q4:
             return {"q4_count": 0, "results": [], "threshold": None}
 
         threshold = max(s["score"] for s in q4)
-
         if not self.llm:
-            results = [
-                {"index": i, "content": s["content"][:50], "score": s["score"],
-                 "verdict": "REVIEW" if s["score"] < 0.5 else "OK",
-                 "suggestion": "Low confidence — manual check recommended" if s["score"] < 0.5 else ""}
-                for i, s in enumerate(q4[:20])
-            ]
-            return {"q4_count": len(q4), "threshold": threshold, "results": results}
+            return {"q4_count": len(q4), "threshold": threshold, "results": []}
 
         all_results = []
         for batch_start in range(0, min(len(q4), 40), 20):
@@ -122,11 +139,18 @@ Only output the JSON array, no markdown fences."""
             )
             try:
                 resp = self.llm.invoke(self.verify_prompt.format(low_score_elements=elements_text))
-                content = resp.content.strip()
-                if content.startswith("```"):
-                    content = re.sub(r"^```\w*\n?", "", content)
-                    content = re.sub(r"\n?```$", "", content)
-                all_results.extend(json.loads(content))
+                content = self._get_text_content(resp).strip()
+
+                # REGEX FILTER FOR JSON EXTRACTION
+                match = re.search(r"\[.*\]", content, re.DOTALL)
+                json_str = match.group(0) if match else content
+                llm_items = json.loads(json_str)
+
+                for item in llm_items:
+                    idx = item.get("index")
+                    if idx is not None and isinstance(idx, int) and 0 <= idx < len(q4):
+                        item["score"] = q4[idx]["score"]
+                all_results.extend(llm_items)
             except Exception as e:
                 print(f"[Agent] Verification error: {e}")
                 all_results.extend([
@@ -140,9 +164,7 @@ Only output the JSON array, no markdown fences."""
     # ── Keyword Extraction & WikiSearch ─────────────────────────
 
     def extract_keywords(self, markdown: str) -> list:
-        """Extract keywords from the paper's Abstract section or full scan."""
         keywords = []
-
         kw_match = re.search(
             r"(?:Keywords?|Key\s*words?)\s*[:：]\s*(.+?)(?:\n\n|\n##|\n#|\Z)",
             markdown,
@@ -156,47 +178,25 @@ Only output the JSON array, no markdown fences."""
         if not keywords and self.llm:
             try:
                 resp = self.llm.invoke(
-                    f"Extract the main technical keywords from this research paper abstract. "
-                    f"Return ONLY a JSON array of strings.\n\n{markdown[:3000]}"
+                    f"Extract the main technical keywords from this research paper. "
+                    f"Return ONLY a JSON array of strings.\n\n{markdown}"
                 )
-                content = resp.content.strip()
-                if content.startswith("```"):
-                    content = re.sub(r"^```\w*\n?", "", content)
-                    content = re.sub(r"\n?```$", "", content)
-                keywords = json.loads(content)
+                content = self._get_text_content(resp).strip()
+
+                # REGEX FILTER FOR JSON
+                match = re.search(r"\[.*\]", content, re.DOTALL)
+                json_str = match.group(0) if match else content
+                keywords = json.loads(json_str)
             except Exception:
                 pass
 
-        return keywords[:15]
-
-    def get_keyword_wiki_urls(self, keywords: list) -> list:
-        """Generate Wikipedia URLs for keywords in target language."""
-        template = WIKI_TEMPLATES.get(self.target_lang, WIKI_TEMPLATES["eng_Latn"])
-        return [
-            {"keyword": kw, "url": template.format(kw.strip().replace(" ", "_"))}
-            for kw in keywords
-        ]
-
-    # ── DB persistence ──────────────────────────────────────────
-
-    def _save_keywords_to_db(self, run_id: str, wiki_urls: list):
-        for item in wiki_urls:
-            self.db.add(EvalKeyword(
-                id=str(uuid.uuid4()),
-                run_id=run_id,
-                keyword=item["keyword"],
-                wiki_url=item["url"],
-            ))
-        self.db.commit()
+        return keywords
 
     # ── Combined Agent Run ──────────────────────────────────────
 
-    def run(self, middle_data: dict, markdown: str, doc_id: str, pdf_name: str) -> dict:
-        """Full agent run: Q4 verify + keywords + WikiSearch."""
-        q4_result = self.verify_q4_elements(middle_data)
+    def run(self, layout_data: dict, markdown: str) -> dict:
+        q4_result = self.verify_q4_elements(layout_data)
         keywords = self.extract_keywords(markdown)
-        wiki_urls = self.get_keyword_wiki_urls(keywords)
-        self._save_keywords_to_db(doc_id, wiki_urls)
 
         return {
             "q4_verification": q4_result,

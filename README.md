@@ -62,7 +62,7 @@ uv sync
 
 1. **Start the FastAPI Backend**:
 ```bash
-uv run uvicorn src.backend.api:app --reload --port 8000
+uv run uvicorn src.backend.api:app --port 8000
 ```
 *(Lưu ý: Quá trình khởi động sẽ mất vài phút để nạp Model NLLB. Bạn sẽ thấy thông báo trạng thái của MinerU API trước khi NLLB bắt đầu nạp).*
 

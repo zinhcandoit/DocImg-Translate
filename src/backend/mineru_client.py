@@ -23,6 +23,7 @@ import zipfile
 import requests
 from pathlib import Path
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 load_dotenv()
 
@@ -45,6 +46,12 @@ class MinerUClient:
 
     # ── Public API ──────────────────────────────────────────────
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=60),
+        retry=retry_if_exception_type(requests.exceptions.RequestException),
+        reraise=True,
+    )
     def extract_from_file(self, file_path: str, model_version: str = "vlm") -> dict:
         """Upload a local file via signed-URL flow and extract."""
         file_path = Path(file_path)
@@ -63,6 +70,9 @@ class MinerUClient:
                 json=data,
                 timeout=30,
             )
+            if res.status_code == 429:
+                print("[MinerU] Rate limit hit (429). Retrying...")
+                raise requests.exceptions.RequestException("Rate limit exceeded")
             res.raise_for_status()
             result = res.json()
             if result.get("code") != 0:
@@ -135,10 +145,15 @@ class MinerUClient:
                 # If we found both, verify this is likely the right one 
                 # (e.g. check if the PDF base name is in the directory or files)
                 if md_file and middle:
-                    # If we are in a subdirectory, check if the parent or files match our 'base'
-                    # Or just trust it if it's the only one found.
-                    print(f"[MinerU] Found mock data in {root}")
-                    return self._build_result(md_file, middle, images if images.exists() else None, str(root))
+                    is_match = (
+                        base in root_path.name or
+                        base in md_file.name or
+                        base in middle.name
+                    )
+                    
+                    if is_match:
+                        print(f"[MinerU] Found mock data for {base} in {root}")
+                        return self._build_result(md_file, middle, images if images.exists() else None, str(root))
 
         return {"status": "error", "message": f"Mock data not found for {base}"}
 

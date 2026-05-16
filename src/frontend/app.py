@@ -1,510 +1,524 @@
 """
-NLLB Translation Service — Paragraph-level translation from layout.json.
+Streamlit Frontend — DIMT Document Translation Pipeline.
 
-Key mechanisms:
-- Uses `para_blocks` from layout.json (lines pre-grouped into paragraphs)
-- `merge_prev`: when True on a text block, the block is a continuation of the
-  previous paragraph — we concatenate them before translation for better context
-- Inline equations are protected with placeholders [EQ_n] during translation
-- Translates at paragraph level (not line-by-line) for coherent output
-- Tables: extracts translatable text from HTML, translates, reconstructs
-- LoRA adapter loaded from nllb-1.3B-multilingual-final/ with 4-bit quantization
-- Target languages: vie_Latn (Vietnamese), deu_Latn (German), fra_Latn (French)
-- Q7: Cross-page stitching — merges cross_page spans and splits back by word ratio
-- Q9: Batch translation — groups paragraphs into batches (max 512 tokens) for throughput
+Features:
+- Upload PDF → Extract via MinerU → Translate via NLLB
+- Optional "Human Check" mode: Q4 verification + HITL editing before translation
+- Rendered markdown preview + editable text area (notebook-style blocks)
+- Download translated PDF (rendered from layout.json + images)
+- References tab: keyword WikiSearch links
+- Q6: Human-in-the-Loop (HITL) editable UI for flagged elements
+- User feedback with MLflow metrics logging
 """
 
-import re
-import copy
+import subprocess
+import sys
 import time
-import torch
-import threading
-from pathlib import Path
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, BitsAndBytesConfig
-from peft import PeftModel
-from html.parser import HTMLParser
+import concurrent.futures
+import streamlit as st
+import requests
 
-# ── Protection patterns for markdown translation ───────────────
-PROTECTED_PATTERNS = [
-    (r"```[\s\S]*?```", "CODE"),
-    (r"`[^`\n]+`", "INLINECODE"),
-    (r"\$\$[\s\S]*?\$\$", "MATH"),
-    (r"\\begin\{[^}]+\}[\s\S]*?\\end\{[^}]+\}", "MATH"),
-    (r"\\\[[\s\S]*?\\\]", "MATH"),
-    (r"\\\([\s\S]*?\\\)", "MATH"),
-    (r"(?<![\w\$])\$(?!\$)(?:[^\$\n\\]|\\.)+\$(?!(?:\w|\$))", "MATH"),
-    # Markdown syntax protection
-    (r"\[([^\]]+)\]\(([^)]+)\)", "LINK"),
-    (r"\!\[([^\]]*)\]\(([^)]+)\)", "IMAGE"),
-    (r"\*\*[^*]+\*\*", "BOLD"),
-    (r"\*[^*]+\*", "ITALIC"),
-]
+st.set_page_config(layout="wide", page_title="DIMT — Document Translation", page_icon="📄")
 
-# Max tokens per batch segment
-BATCH_MAX_TOKENS = 512
+API_BASE = "http://localhost:8000"
+
+# Generous timeout for long operations (translation can take minutes)
+LONG_TIMEOUT = 600  # 10 minutes
 
 
-class NLLBService:
-    SUPPORTED_LANGS = ["vie_Latn", "deu_Latn", "fra_Latn"]
-
-    # Human-readable display names for the frontend
-    LANG_DISPLAY = {
-        "vie_Latn": "Vietnamese (vie_Latn)",
-        "fra_Latn": "French (fra_Latn)",
-        "deu_Latn": "German (deu_Latn)",
-    }
-
-    def __init__(self, device=None, tgt_lang: str = "vie_Latn",
-                 adapter_path: str = "nllb-1.3B-multilingual-final",
-                 lazy_load: bool = False):
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.loaded = False
-        self.src_lang = "eng_Latn"
-        self.tgt_lang = tgt_lang
-        self.model_name = "facebook/nllb-200-distilled-1.3B"
-        self.adapter_path = adapter_path
-        self._load_event = threading.Event()
-
-        if not lazy_load:
-            self.load_model()
-
-    def load_model(self):
-        if self.loaded:
-            return
+# ── Backend startup (HF Spaces: only one process allowed) ───
+@st.cache_resource
+def start_backend():
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn",
+         "src.backend.api:app", "--host", "0.0.0.0", "--port", "8000"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    # Poll until backend is up (max 180s for NLLB to load)
+    for _ in range(180):
         try:
-            print(f"[NLLB] Loading {self.model_name} + LoRA adapter from {self.adapter_path}...")
-
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.adapter_path, src_lang=self.src_lang
-            )
-
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16 if self.device == "cuda" else torch.float16,
-            )
-
-            base_model = AutoModelForSeq2SeqLM.from_pretrained(
-                self.model_name,
-                quantization_config=bnb_config,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-            )
-
-            padded = (len(self.tokenizer) + 63) // 64 * 64
-            base_model.resize_token_embeddings(padded, mean_resizing=False)
-
-            self.model = PeftModel.from_pretrained(base_model, self.adapter_path)
-            self.model.eval()
-
-            self.loaded = True
-            print("[NLLB] Model + LoRA adapter loaded successfully")
+            requests.get(f"{API_BASE}/docs", timeout=1)
+            return proc
         except Exception:
-            import traceback
-            print("[NLLB] Load failed:")
-            traceback.print_exc()
-        finally:
-            self._load_event.set()
+            time.sleep(1)
+    return proc  # return anyway, let requests fail naturally
 
-    def wait_for_load(self):
-        self._load_event.wait()
+start_backend()
 
-    def set_target_lang(self, lang_code: str):
-        """Switch target language. Supports vie_Latn, deu_Latn, fra_Latn."""
-        if lang_code not in self.SUPPORTED_LANGS:
-            raise ValueError(f"Unsupported language: {lang_code}. Use one of {self.SUPPORTED_LANGS}")
-        self.tgt_lang = lang_code
+# ── rest of file unchanged below ────────────────────────────
 
-    # ── Core translate ──────────────────────────────────────────────
+st.title("📄 Document Intelligent Machine Translation")
+st.caption("PDF → MinerU extraction → NLLB translation → Translated PDF + Markdown")
 
-    def _translate_text(self, text: str) -> str:
-        """Translate a single string. Returns mock if model not loaded."""
-        if not text.strip():
-            return text
-        if not self.loaded:
-            return f"[{self.tgt_lang}] {text}"
+# ── Session State ───────────────────────────────────────────
+for key in ["doc_id", "original_markdown", "translated_markdown",
+            "agent_result", "pdf_ready", "has_middle", "hitl_blocks",
+            "q4_result", "human_check", "q4_confirmed",
+            "keywords_result", "num_pages", "num_paragraphs"]:
+    if key not in st.session_state:
+        st.session_state[key] = 0 if "num_" in key else None
 
-        self.tokenizer.src_lang = self.src_lang
-        self.tokenizer.tgt_lang = self.tgt_lang
+# ── Sidebar ─────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ Settings")
+    uploaded_file = st.file_uploader("Upload PDF document", type=["pdf"])
+    st.slider("Max convert pages", 1, 200, 200)
+    st.selectbox("MinerU Engine", ["vlm", "pipeline"])
+    target_lang = st.selectbox("Target Language", [
+        "French (fra_Latn)",
+        "German (deu_Latn)",
+    ])
+    tgt_lang_code = "fra_Latn" if "fra" in target_lang else "deu_Latn"
+    agent_llm = st.selectbox("Agent LLM", ["DeepSeek", "Gemini"])
+    agent_llm_code = "gemini" if agent_llm == "Gemini" else "deepseek"
 
-        forced_bos_id = self.tokenizer.convert_tokens_to_ids(self.tgt_lang)
-        inputs = self.tokenizer(
-            text, return_tensors="pt", truncation=True, max_length=512
-        ).to(self.model.device)
-        with torch.no_grad():
-            out = self.model.generate(
-                **inputs,
-                forced_bos_token_id=forced_bos_id,
-                max_length=512,
-                num_beams=4,
-            )
-        return self.tokenizer.batch_decode(out, skip_special_tokens=True)[0].strip()
+    st.divider()
+    human_check = st.checkbox("🔍 Human Check", value=False,
+                              help="Enable Q4 verification & HITL editing before translation")
+    col1, col2 = st.columns(2)
+    convert_btn = col1.button("🚀 Convert", use_container_width=True)
+    clear_btn = col2.button("🗑️ Clear", use_container_width=True)
 
-    def _translate_batch(self, texts: list[str]) -> list[str]:
-        """Q9: Translate a batch of strings for better GPU utilization."""
-        if not texts:
-            return []
-        if not self.loaded:
-            return [f"[{self.tgt_lang}] {t}" for t in texts]
+if clear_btn:
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
 
-        self.tokenizer.src_lang = self.src_lang
-        self.tokenizer.tgt_lang = self.tgt_lang
-        forced_bos_id = self.tokenizer.convert_tokens_to_ids(self.tgt_lang)
 
-        inputs = self.tokenizer(
-            texts, return_tensors="pt", truncation=True,
-            max_length=512, padding=True
-        ).to(self.model.device)
+# ── Helper: run translate + render sequentially ─────────────
+def _run_translate_and_render(doc_id, tgt_lang, num_paras=0, num_pages=0):
+    """Called in a thread — translate then render with dynamic timeout."""
+    # Based on observation: ~18s/paragraph and ~2s/page. 
+    # We use 20s and 5s + 600s buffer for safety.
+    dynamic_timeout = (num_paras * 20) + (num_pages * 5) + 600
+    if dynamic_timeout < LONG_TIMEOUT: 
+        dynamic_timeout = LONG_TIMEOUT
 
-        with torch.no_grad():
-            out = self.model.generate(
-                **inputs,
-                forced_bos_token_id=forced_bos_id,
-                max_length=512,
-                num_beams=4,
-            )
-        results = self.tokenizer.batch_decode(out, skip_special_tokens=True)
-        return [r.strip() for r in results]
+    tr = requests.post(
+        f"{API_BASE}/translate",
+        json={"doc_id": doc_id, "tgt_lang": tgt_lang},
+        timeout=dynamic_timeout,
+    )
+    tr_data = tr.json() if tr.status_code == 200 else {}
+    if tr_data.get("status") != "success":
+        return {"status": "error", "step": "translate", "data": tr_data}
 
-    # ── Paragraph extraction from layout.json ───────────────────────
+    # Only render if layout.json exists
+    if tr_data.get("has_middle_json"):
+        rr = requests.post(
+            f"{API_BASE}/render-pdf",
+            json={"doc_id": doc_id},
+            timeout=dynamic_timeout,
+        )
+        rr_data = rr.json() if rr.status_code == 200 else {}
+        return {"status": "success", "translate": tr_data, "render": rr_data}
 
-    def translate_middle_json(self, middle_data: dict) -> dict:
-        """
-        Translate all translatable content in layout.json in-place.
+    return {"status": "success", "translate": tr_data, "render": None}
 
-        Uses para_blocks for paragraph-level grouping.
-        Respects merge_prev to concatenate continuation blocks.
-        Protects inline_equation spans with placeholders.
-        Q7: Handles cross_page spans via stitching + word-ratio split.
-        Q9: Batches paragraphs for efficient GPU throughput.
-        Returns a deep-copied middle_data with translated content.
-        """
-        t_start = time.time()
-        translated = copy.deepcopy(middle_data)
-        pages = translated.get("pdf_info", [])
-        total_pages = len(pages)
 
-        # Q7: Cross-page stitching
-        self._stitch_cross_page(pages)
+def _run_keywords(doc_id, llm_provider="deepseek"):
+    """Called in a thread — extract keywords (shorter timeout, not GPU-bound)."""
+    res = requests.post(
+        f"{API_BASE}/agent/keywords",
+        json={"doc_id": doc_id, "llm_provider": llm_provider},
+        timeout=120,
+    )
+    return res.json() if res.status_code == 200 else {}
 
-        all_jobs = []
 
-        for pi, page in enumerate(pages):
-            blocks = page.get("preproc_blocks", page.get("para_blocks", []))
-            jobs = self._collect_translation_jobs(blocks)
-            all_jobs.extend(jobs)
-            if (pi + 1) % 5 == 0 or pi == total_pages - 1:
-                print(f"[NLLB] Collected jobs from page {pi+1}/{total_pages} (total jobs: {len(all_jobs)})")
+# ── Pipeline Execution ─────────────────────────────────────
+if convert_btn and uploaded_file:
+    # Step 1: Upload & Extract
+    with st.spinner("📤 Uploading & extracting with MinerU..."):
+        try:
+            files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
+            res = requests.post(f"{API_BASE}/upload", files=files, timeout=LONG_TIMEOUT)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "success":
+                    st.session_state.doc_id = data["doc_id"]
+                    st.session_state.num_pages = data.get("num_pages", 0)
+                    st.session_state.num_paragraphs = data.get("num_paragraphs", 0)
+                    st.session_state.human_check = human_check
+                    st.session_state.q4_confirmed = False
+                    st.success(f"✅ Extraction complete (ID: {data['doc_id']}) — "
+                               f"Found {st.session_state.num_pages} pages, {st.session_state.num_paragraphs} paragraphs")
+                else:
+                    st.error(f"❌ Extraction failed: {data.get('message')}")
+            else:
+                st.error(f"❌ API error: {res.status_code} — {res.text[:200]}")
+        except requests.exceptions.Timeout:
+            st.error("❌ Upload timed out. The PDF may be too large.")
+        except requests.exceptions.ConnectionError:
+            st.error("❌ Cannot connect to backend. Is the server running?")
 
-        # Q9: Batch translate
-        if all_jobs:
-            print(f"[NLLB] Translating {len(all_jobs)} paragraphs...")
-            texts = [job[1] for job in all_jobs]
+    # Step 2: If Human Check → run Q4 verification and stop (wait for confirm)
+    if st.session_state.human_check and st.session_state.doc_id:
+        with st.spinner("🔍 Running Q4 verification (Agent)..."):
+            try:
+                res = requests.post(
+                    f"{API_BASE}/agent/verify",
+                    json={"doc_id": st.session_state.doc_id, "llm_provider": agent_llm_code},
+                    timeout=LONG_TIMEOUT,
+                )
+                if res.status_code == 200:
+                    result = res.json()
+                    if result.get("status") == "success":
+                        st.session_state.q4_result = result.get("q4_verification", {})
+                        st.success("✅ Q4 verification complete — review flagged elements below")
+                    else:
+                        st.error(f"❌ Q4 verification failed: {result.get('message')}")
+            except requests.exceptions.Timeout:
+                st.error("❌ Q4 verification timed out.")
+            except requests.exceptions.ConnectionError:
+                st.error("❌ Cannot connect to backend.")
+        # Pipeline pauses here — user must review HITL and click Confirm
 
-            unique_texts = []
-            text_to_idx = {}
-            for text in texts:
-                if text not in text_to_idx:
-                    text_to_idx[text] = len(unique_texts)
-                    unique_texts.append(text)
+    # Step 2b: If NOT Human Check → run translate+render+keywords in parallel
+    if not st.session_state.human_check and st.session_state.doc_id:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        
+        dynamic_timeout = (st.session_state.num_paragraphs * 20) + (st.session_state.num_pages * 5) + 600
+        if dynamic_timeout < LONG_TIMEOUT: 
+            dynamic_timeout = LONG_TIMEOUT
 
-            translated_unique = []
-            batch = []
-            batch_tok_count = 0
-
-            for utext in unique_texts:
-                tok_count = len(utext.split())
-                if batch and batch_tok_count + tok_count > BATCH_MAX_TOKENS:
-                    translated_unique.extend(self._translate_batch(batch))
-                    batch = []
-                    batch_tok_count = 0
-                batch.append(utext)
-                batch_tok_count += tok_count
-
-            if batch:
-                translated_unique.extend(self._translate_batch(batch))
-
-            translated_texts = [translated_unique[text_to_idx[text]] for text in texts]
-
-            for i, (chain, _, eq_map) in enumerate(all_jobs):
-                tr = self._restore_equations(translated_texts[i], eq_map)
-                self._write_back_translated(chain, tr)
-
-            if (i + 1) % 50 == 0:
-                    print(f"[NLLB] Written back {i+1}/{len(all_jobs)} translations")
-
-        # Translate tables separately
-        for pi, page in enumerate(pages):
-            blocks = page.get("preproc_blocks", page.get("para_blocks", []))
-            for block in blocks:
-                if block.get("type") == "table":
-                    self._translate_table_block(block)
-
-        elapsed = time.time() - t_start
-        print(f"[NLLB] ✅ Layout translation complete in {elapsed:.1f}s ({len(all_jobs)} paragraphs)")
-        return translated
-
-    def _is_quartet_text(self, obj) -> bool:
-        if not isinstance(obj, dict): return False
-        return (
-            "bbox" in obj and
-            obj.get("type") == "text" and
-            "content" in obj and
-            isinstance(obj.get("score"), (int, float))
+        fut_pipeline = executor.submit(
+            _run_translate_and_render,
+            st.session_state.doc_id, tgt_lang_code,
+            st.session_state.num_paragraphs, st.session_state.num_pages
+        )
+        fut_keywords = executor.submit(
+            _run_keywords, st.session_state.doc_id, agent_llm_code
         )
 
-    def _contains_quartet_recursive(self, obj) -> bool:
-        if self._is_quartet_text(obj):
-            return True
-        if isinstance(obj, dict):
-            for v in obj.values():
-                if self._contains_quartet_recursive(v): return True
-        elif isinstance(obj, list):
-            for item in obj:
-                if self._contains_quartet_recursive(item): return True
-        return False
+        # Pipeline A: Translate + Render (critical path)
+        with st.spinner("🔄 Translating & rendering PDF... (this may take several minutes)"):
+            try:
+                pipeline_result = fut_pipeline.result(timeout=dynamic_timeout)
+                if pipeline_result.get("status") == "success":
+                    tr_data = pipeline_result.get("translate", {})
+                    st.session_state.translated_markdown = tr_data.get("translated_markdown", "")
+                    st.session_state.has_middle = tr_data.get("has_middle_json", False)
+                    rr_data = pipeline_result.get("render")
+                    if rr_data and rr_data.get("status") == "success":
+                        st.session_state.pdf_ready = True
+                    st.success("✅ Translation & PDF rendering complete")
+                else:
+                    st.error(f"❌ Pipeline failed at {pipeline_result.get('step', 'unknown')}")
+            except concurrent.futures.TimeoutError:
+                st.error(f"❌ Translation pipeline timed out after {dynamic_timeout}s. The document might be too large.")
+            except Exception as e:
+                st.error(f"❌ Translation pipeline error: {e}")
 
-    def _collect_translation_jobs(self, blocks: list) -> list:
-        jobs = []
-        i = 0
-        while i < len(blocks):
-            block = blocks[i]
+        # Pipeline B: Keywords (independent, shorter timeout)
+        with st.spinner("📚 Extracting keywords & references..."):
+            try:
+                kw_result = fut_keywords.result(timeout=120)
+                if kw_result.get("status") == "success":
+                    st.session_state.keywords_result = kw_result
+                    st.success("✅ Keywords extracted")
+            except concurrent.futures.TimeoutError:
+                st.info("📚 Keywords extraction timed out. Use the retry button in References tab.")
+            except Exception as e:
+                st.warning(f"⚠️ Keywords error: {e}")
 
-            if self._contains_quartet_recursive(block) or block.get("lines"):
-                chain = [block]
-                j = i + 1
-                while j < len(blocks) and blocks[j].get("merge_prev") is True:
-                    chain.append(blocks[j])
-                    j += 1
+        executor.shutdown(wait=False)
 
-                paragraph, eq_map = self._extract_paragraph(chain)
-                if paragraph.strip():
-                    jobs.append((chain, paragraph, eq_map))
 
-                if "blocks" in block:
-                    jobs.extend(self._collect_translation_jobs(block["blocks"]))
+# ── HITL Review & Confirm (only when Human Check is on) ────
+if (st.session_state.human_check
+    and st.session_state.q4_result
+    and not st.session_state.q4_confirmed):
 
-                i = j
-            elif "blocks" in block:
-                jobs.extend(self._collect_translation_jobs(block["blocks"]))
-                i += 1
+    st.header("🔍 Q4 Verification — Review Flagged Elements")
+    q4 = st.session_state.q4_result
+
+    st.info(f"Found **{q4.get('q4_count', 0)}** elements in the bottom 25th percentile. "
+            f"Threshold: {q4.get('threshold', 'N/A')}")
+
+    for i, item in enumerate(q4.get("results", [])[:20]):
+        icon = "✅" if item.get("verdict") == "OK" else "⚠️"
+        score_val = item.get('score', 'N/A')
+        score_str = f"{score_val:.3f}" if isinstance(score_val, (int, float)) else str(score_val)
+
+        with st.expander(
+            f"{icon} [{item.get('index')}] score={score_str} → {item.get('verdict', 'N/A')} "
+            f"| `{item.get('content', '')[:60]}`",
+            expanded=(item.get("verdict") == "REVIEW"),
+        ):
+            if item.get("suggestion"):
+                st.caption(f"💡 {item['suggestion']}")
+
+    st.divider()
+    if st.button("✅ Confirm & Continue Pipeline", use_container_width=True, type="primary"):
+        st.session_state.q4_confirmed = True
+        st.rerun()
+
+
+# ── After Confirm: run translate+render+keywords in parallel
+if (st.session_state.human_check
+    and st.session_state.q4_confirmed
+    and st.session_state.doc_id
+    and st.session_state.translated_markdown is None):
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    
+    dynamic_timeout = (st.session_state.num_paragraphs * 20) + (st.session_state.num_pages * 5) + 600
+    if dynamic_timeout < LONG_TIMEOUT: 
+        dynamic_timeout = LONG_TIMEOUT
+
+    fut_pipeline = executor.submit(
+        _run_translate_and_render,
+        st.session_state.doc_id, tgt_lang_code,
+        st.session_state.num_paragraphs, st.session_state.num_pages
+    )
+    fut_keywords = executor.submit(
+        _run_keywords, st.session_state.doc_id, agent_llm_code
+    )
+
+    # Pipeline A: Translate + Render (critical path)
+    with st.spinner("🔄 Translating & rendering PDF... (this may take several minutes)"):
+        try:
+            pipeline_result = fut_pipeline.result(timeout=dynamic_timeout)
+            if pipeline_result.get("status") == "success":
+                tr_data = pipeline_result.get("translate", {})
+                st.session_state.translated_markdown = tr_data.get("translated_markdown", "")
+                st.session_state.has_middle = tr_data.get("has_middle_json", False)
+                rr_data = pipeline_result.get("render")
+                if rr_data and rr_data.get("status") == "success":
+                    st.session_state.pdf_ready = True
+                st.success("✅ Translation & PDF rendering complete")
             else:
-                i += 1
+                st.error(f"❌ Pipeline failed at {pipeline_result.get('step', 'unknown')}")
+        except concurrent.futures.TimeoutError:
+            st.error(f"❌ Translation pipeline timed out after {dynamic_timeout}s. The document might be too large.")
+        except Exception as e:
+            st.error(f"❌ Translation pipeline error: {e}")
 
-        return jobs
+    # Pipeline B: Keywords (independent, shorter timeout)
+    with st.spinner("📚 Extracting keywords & references..."):
+        try:
+            kw_result = fut_keywords.result(timeout=120)
+            if kw_result.get("status") == "success":
+                st.session_state.keywords_result = kw_result
+                st.success("✅ Keywords extracted")
+        except concurrent.futures.TimeoutError:
+            st.info("📚 Keywords extraction timed out. Use the retry button in References tab.")
+        except Exception as e:
+            st.warning(f"⚠️ Keywords error: {e}")
 
-    def _stitch_cross_page(self, pages: list):
-        """Q7: Cross-page stitching."""
-        for pi in range(len(pages) - 1):
-            current_blocks = pages[pi].get("para_blocks", [])
-            next_blocks = pages[pi + 1].get("para_blocks", [])
-            if not current_blocks or not next_blocks:
-                continue
+    executor.shutdown(wait=False)
 
-            last_block = current_blocks[-1]
-            has_cross_page = False
-            for line in last_block.get("lines", []):
-                for span in line.get("spans", []):
-                    if span.get("cross_page", False):
-                        has_cross_page = True
-                        break
-                if has_cross_page:
-                    break
+    # Also fetch HITL blocks after translation
+    if st.session_state.has_middle:
+        try:
+            hitl_res = requests.get(
+                f"{API_BASE}/hitl/blocks/{st.session_state.doc_id}",
+                timeout=30,
+            )
+            if hitl_res.status_code == 200:
+                st.session_state.hitl_blocks = hitl_res.json().get("flagged_blocks", [])
+        except Exception:
+            pass
 
-            if has_cross_page:
-                first_next = next_blocks[0]
-                merged_lines = last_block.get("lines", []) + first_next.get("lines", [])
-                first_next["lines"] = merged_lines
-                first_next["_cross_page_merged"] = True
-                first_next["_original_page_line_count"] = len(last_block.get("lines", []))
-                last_block["lines"] = []
-                last_block["_merged_to_next"] = True
-                print(f"[NLLB] Cross-page stitch: page {pi} → page {pi+1}")
 
-    def _extract_paragraph(self, block_chain: list) -> tuple:
-        parts = []
-        eq_map = {}
-        eq_idx = 0
+# ── Results Display ────────────────────────────────────────
+if st.session_state.translated_markdown is not None:
+    st.header("📊 Results")
 
-        for block in block_chain:
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    if self._is_quartet_text(span):
-                        parts.append(span["content"])
-                    elif span.get("type") == "inline_equation":
-                        placeholder = f"[EQ_{eq_idx}]"
-                        eq_map[placeholder] = span.get("content", "")
-                        parts.append(placeholder)
-                        eq_idx += 1
-                    elif span.get("type") == "interline_equation":
-                        placeholder = f"[EQ_{eq_idx}]"
-                        eq_map[placeholder] = span.get("content", "")
-                        parts.append(placeholder)
-                        eq_idx += 1
-                parts.append(" ")
+    # Build tabs dynamically based on human_check
+    if st.session_state.human_check:
+        tab_names = ["📝 Translated Markdown", "✏️ Editable Text",
+                     "🔧 HITL Verification", "📚 References", "📥 Downloads"]
+        tabs = st.tabs(tab_names)
+        tab_md, tab_edit, tab_hitl, tab_ref, tab_dl = tabs
+    else:
+        tab_names = ["📝 Translated Markdown", "✏️ Editable Text",
+                     "📚 References", "📥 Downloads"]
+        tabs = st.tabs(tab_names)
+        tab_md, tab_edit, tab_ref, tab_dl = tabs
+        tab_hitl = None
 
-        return " ".join(parts).strip(), eq_map
+    start_edit_time = time.time()
 
-    def _restore_equations(self, text: str, eq_map: dict) -> str:
-        for placeholder, original in sorted(eq_map.items(), key=lambda x: len(x[0]), reverse=True):
-            text = text.replace(placeholder, original)
-        return text
+    with tab_md:
+        st.markdown(st.session_state.translated_markdown, unsafe_allow_html=True)
 
-    def _write_back_translated(self, chain: list, translated_text: str):
-        translated_words = translated_text.split()
-        if not translated_words:
-            return
+    with tab_edit:
+        st.subheader("✏️ Editable Translated Blocks")
+        st.caption("Each block corresponds to a paragraph in the translated layout. "
+                   "Edit as needed, then submit feedback below.")
 
-        block_word_counts = []
-        total_orig_words = 0
-
-        for b in chain:
-            b_words = 0
-            for line in b.get("lines", []):
-                for span in line.get("spans", []):
-                    if self._is_quartet_text(span):
-                        b_words += len(span.get("content", "").split())
-
-            if b_words == 0 and b.get("merge_prev") is True:
-                b_words = 1
-
-            block_word_counts.append(b_words)
-            total_orig_words += b_words
-
-        word_idx = 0
-        for i, b in enumerate(chain):
-            if i == len(chain) - 1:
-                block_words = translated_words[word_idx:]
-            else:
-                ratio = block_word_counts[i] / total_orig_words
-                alloc_count = int(len(translated_words) * ratio)
-                block_words = translated_words[word_idx : word_idx + alloc_count]
-                word_idx += alloc_count
-
-            block_translated_text = " ".join(block_words)
-
-            b.pop("_merged", None)
-
-            if block_translated_text:
-                b["lines"] = [{
-                    "bbox": b.get("bbox", [0, 0, 0, 0]),
-                    "spans": [{
-                        "bbox": b.get("bbox", [0, 0, 0, 0]),
-                        "type": "text",
-                        "content": block_translated_text,
-                        "score": 1.0,
-                        "translated": True,
-                    }]
-                }]
-            else:
-                b["lines"] = [{
-                    "bbox": b.get("bbox", [0, 0, 0, 0]),
-                    "spans": [{
-                        "bbox": b.get("bbox", [0, 0, 0, 0]),
-                        "type": "text",
-                        "content": " ",
-                        "score": 1.0,
-                        "translated": True,
-                    }]
-                }]
-
-    # ── Table translation ────────────────────────────────────────────
-
-    def _translate_table_block(self, block: dict):
-        for sub in block.get("blocks", []):
-            for line in sub.get("lines", []):
-                for span in line.get("spans", []):
-                    if span.get("type") == "table" and "html" in span:
-                        span["html"] = self._translate_table_html(span["html"])
-
-    def _translate_table_html(self, html: str) -> str:
-        def replace_cell(match):
-            tag = match.group(1)
-            content = match.group(2)
-            close = match.group(3)
-
-            eq_map = {}
-            eq_idx = 0
-            def protect_eq(m):
-                nonlocal eq_idx
-                key = f"[TEQ_{eq_idx}]"
-                eq_map[key] = m.group(0)
-                eq_idx += 1
-                return key
-            protected = re.sub(r"<eq>.*?</eq>", protect_eq, content)
-
-            text_only = re.sub(r"<[^>]+>", "", protected).strip()
-            if text_only:
-                translated = self._translate_text(protected)
-                for k, v in eq_map.items():
-                    translated = translated.replace(k, v)
-                return f"<{tag}>{translated}</{close}>"
-            return match.group(0)
-
-        return re.sub(
-            r"<(t[dh][^>]*)>(.*?)</(t[dh])>",
-            replace_cell,
-            html,
-            flags=re.DOTALL,
+        # Show as notebook-style blocks if we have translated_middle data
+        edited_text = st.text_area(
+            "Edit translated markdown (feedback loop)",
+            st.session_state.translated_markdown,
+            height=500,
         )
 
-    # ── Markdown-level translation ───────────────────────────────────
+        st.subheader("📊 Submit Evaluation")
+        rating = st.slider("Rate the translation quality (1-5)", 1, 5, 3)
+        downloaded = st.checkbox("Downloaded generated file?")
+        if st.button("📤 Submit Feedback & Save Metrics"):
+            time_consumed = time.time() - start_edit_time
+            try:
+                res = requests.post(f"{API_BASE}/feedback", json={
+                    "doc_id": st.session_state.doc_id,
+                    "original_md": st.session_state.translated_markdown,
+                    "modified_md": edited_text,
+                    "user_rating": rating,
+                    "downloaded": downloaded,
+                    "time_consumed": time_consumed,
+                }, timeout=30)
+                if res.status_code == 200:
+                    st.success(f"✅ Metrics logged: {res.json().get('metrics', {})}")
+                else:
+                    st.error(f"❌ Feedback error: {res.status_code}")
+            except Exception as e:
+                st.error(f"❌ Feedback error: {e}")
 
-    def translate_markdown(self, md_content: str) -> str:
-        lines = md_content.split("\n")
-        total_lines = len(lines)
-        translated_lines = []
-        print(f"[NLLB] Translating markdown ({total_lines} lines)...")
+    # HITL Verification Tab (only if human_check)
+    if tab_hitl is not None:
+        with tab_hitl:
+            st.subheader("🔧 Human-in-the-Loop Verification")
+            st.caption("Edit flagged translations below and re-render the PDF.")
 
-        for li, line in enumerate(lines):
-            if not line.strip():
-                translated_lines.append("")
-                continue
-            if line.strip().startswith("\\[") or line.strip().startswith("$$") or line.strip().startswith("```"):
-                translated_lines.append(line)
-                continue
+            if st.session_state.hitl_blocks:
+                blocks = st.session_state.hitl_blocks
+                st.info(f"Found **{len(blocks)}** flagged elements that need review.")
 
-            protected_text, mapping = self._protect(line)
-            translated_text = self._translate_text(protected_text)
-            final_text = self._restore(translated_text, mapping)
-            translated_lines.append(final_text)
+                for i, block in enumerate(blocks):
+                    with st.expander(
+                        f"⚠️ Page {block['page_idx']+1}, Block {block['block_idx']} "
+                        f"(score: {block.get('score', 0):.3f}, type: {block.get('type', 'text')})",
+                        expanded=(i < 3),
+                    ):
+                        st.caption(f"💡 Suggestion: {block.get('suggestion', 'Manual review recommended')}")
 
-            if (li + 1) % 20 == 0:
-                print(f"[NLLB] Markdown: {li+1}/{total_lines} lines translated")
+                        st.text_area(
+                            "Original content (read-only)",
+                            block.get("original_content", ""),
+                            height=80,
+                            disabled=True,
+                            key=f"hitl_orig_{i}",
+                        )
 
-        print(f"[NLLB] ✅ Markdown translation complete ({total_lines} lines)")
-        return "\n".join(translated_lines)
+                        new_text = st.text_area(
+                            "Current translation (edit below)",
+                            block.get("current_content", ""),
+                            height=100,
+                            key=f"hitl_edit_{i}",
+                        )
 
-    def _protect(self, text: str) -> tuple:
-        from collections import defaultdict
-        placeholders = {}
-        counts = defaultdict(int)
+                        if st.button(f"💾 Save Edit", key=f"hitl_save_{i}"):
+                            try:
+                                res = requests.post(f"{API_BASE}/hitl/update", json={
+                                    "doc_id": st.session_state.doc_id,
+                                    "page_idx": block["page_idx"],
+                                    "block_idx": block["block_idx"],
+                                    "new_text": new_text,
+                                }, timeout=10)
+                                if res.status_code == 200 and res.json().get("status") == "success":
+                                    st.success("✅ Block updated!")
+                                else:
+                                    st.error(f"❌ Update failed: {res.json().get('message', 'Unknown error')}")
+                            except Exception as e:
+                                st.error(f"❌ Error: {e}")
 
-        all_matches = []
-        for pattern, tag in PROTECTED_PATTERNS:
-            for m in re.finditer(pattern, text):
-                all_matches.append((m.start(), m.end(), m.group(), tag))
+                st.divider()
+                if st.button("🔄 Re-render PDF with edits", use_container_width=True):
+                    with st.spinner("📄 Re-rendering PDF with your edits..."):
+                        try:
+                            res = requests.post(
+                                f"{API_BASE}/render-pdf",
+                                json={"doc_id": st.session_state.doc_id},
+                                timeout=LONG_TIMEOUT,
+                            )
+                            if res.status_code == 200 and res.json().get("status") == "success":
+                                st.session_state.pdf_ready = True
+                                st.success("✅ PDF re-rendered with your edits!")
+                            else:
+                                st.error(f"❌ Re-render failed: {res.json().get('message')}")
+                        except Exception as e:
+                            st.error(f"❌ Re-render error: {e}")
+            else:
+                if st.session_state.q4_result:
+                    st.success("✅ No flagged elements — all translations look good!")
+                else:
+                    st.info("No Q4 verification data available.")
 
-        all_matches.sort(key=lambda x: (x[0], -x[1]))
-        filtered = []
-        last_end = -1
-        for s, e, c, t in all_matches:
-            if s >= last_end:
-                filtered.append((s, e, c, t))
-                last_end = e
+    # References Tab
+    with tab_ref:
+        st.subheader("📚 Keywords & Wikipedia References")
+        kw_result = st.session_state.keywords_result
+        if kw_result and kw_result.get("status") == "success":
+            keywords = kw_result.get("keywords", [])
+            wiki = kw_result.get("wiki_references", [])
+            if wiki:
+                for ref in wiki:
+                    urls = []
+                    if ref.get("url"):
+                        urls.append(f"[Target Lang]({ref['url']})")
+                    if ref.get("en_url"):
+                        urls.append(f"[English]({ref['en_url']})")
+                    if urls:
+                        links = " | ".join(urls)
+                        st.markdown(f"- **{ref['keyword']}** → {links}")
+            elif keywords:
+                st.write(", ".join(keywords))
+            else:
+                st.info("No keywords extracted")
+        else:
+            st.info("Keywords not yet available.")
+            if st.session_state.doc_id and st.button("🔄 Retry Keywords Extraction"):
+                with st.spinner("📚 Extracting keywords..."):
+                    try:
+                        res = requests.post(
+                            f"{API_BASE}/agent/keywords",
+                            json={"doc_id": st.session_state.doc_id, "llm_provider": agent_llm_code},
+                            timeout=120,
+                        )
+                        if res.status_code == 200:
+                            result = res.json()
+                            if result.get("status") == "success":
+                                st.session_state.keywords_result = result
+                                st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Keywords error: {e}")
 
-        result = text
-        for s, e, c, t in sorted(filtered, key=lambda x: x[0], reverse=True):
-            idx = counts[t]
-            ph = f"[{t}_{idx}]"
-            counts[t] += 1
-            placeholders[ph] = c
-            result = result[:s] + ph + result[e:]
+    # Downloads Tab
+    with tab_dl:
+        st.subheader("📥 Download & Preview")
 
-        return result, placeholders
+        if st.session_state.pdf_ready and st.session_state.doc_id:
+            try:
+                pdf_res = requests.get(
+                    f"{API_BASE}/stream-pdf/{st.session_state.doc_id}",
+                    timeout=30,
+                )
+                if pdf_res.status_code == 200:
+                    import base64
+                    pdf_bytes = pdf_res.content
 
-    def _restore(self, text: str, placeholders: dict) -> str:
-        for ph, orig in sorted(placeholders.items(), key=lambda x: len(x[0]), reverse=True):
-            text = text.replace(ph, orig)
-        return text
+                    st.divider()
+                    st.subheader("👁️ PDF Preview")
+
+                    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
+                    st.markdown(pdf_display, unsafe_allow_html=True)
+
+                    st.divider()
+                    st.download_button(
+                        "💾 Save Translated PDF",
+                        pdf_bytes,
+                        file_name=f"{st.session_state.doc_id}_translated.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+                else:
+                    st.warning("PDF stream not available")
+            except Exception as e:
+                st.error(f"PDF preview error: {e}")
+        else:
+            st.info("PDF will be available after conversion with layout.json data")
