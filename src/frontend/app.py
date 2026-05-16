@@ -1,237 +1,510 @@
 """
-Streamlit Frontend — DIMT Document Translation Pipeline.
+NLLB Translation Service — Paragraph-level translation from layout.json.
 
-Features:
-- Upload PDF → Extract via MinerU → Translate via NLLB
-- Rendered markdown preview + editable text area
-- Download translated PDF (rendered from middle.json + images)
-- AI Agent panel: Q4 verification results + keyword WikiSearch links
-- User feedback with MLflow metrics logging
+Key mechanisms:
+- Uses `para_blocks` from layout.json (lines pre-grouped into paragraphs)
+- `merge_prev`: when True on a text block, the block is a continuation of the
+  previous paragraph — we concatenate them before translation for better context
+- Inline equations are protected with placeholders [EQ_n] during translation
+- Translates at paragraph level (not line-by-line) for coherent output
+- Tables: extracts translatable text from HTML, translates, reconstructs
+- LoRA adapter loaded from nllb-1.3B-multilingual-final/ with 4-bit quantization
+- Target languages: vie_Latn (Vietnamese), deu_Latn (German), fra_Latn (French)
+- Q7: Cross-page stitching — merges cross_page spans and splits back by word ratio
+- Q9: Batch translation — groups paragraphs into batches (max 512 tokens) for throughput
 """
 
-import subprocess
-import sys
+import re
+import copy
 import time
-import streamlit as st
-import requests
+import torch
+import threading
+from pathlib import Path
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, BitsAndBytesConfig
+from peft import PeftModel
+from html.parser import HTMLParser
 
-st.set_page_config(layout="wide", page_title="DIMT — Document Translation", page_icon="📄")
+# ── Protection patterns for markdown translation ───────────────
+PROTECTED_PATTERNS = [
+    (r"```[\s\S]*?```", "CODE"),
+    (r"`[^`\n]+`", "INLINECODE"),
+    (r"\$\$[\s\S]*?\$\$", "MATH"),
+    (r"\\begin\{[^}]+\}[\s\S]*?\\end\{[^}]+\}", "MATH"),
+    (r"\\\[[\s\S]*?\\\]", "MATH"),
+    (r"\\\([\s\S]*?\\\)", "MATH"),
+    (r"(?<![\w\$])\$(?!\$)(?:[^\$\n\\]|\\.)+\$(?!(?:\w|\$))", "MATH"),
+    # Markdown syntax protection
+    (r"\[([^\]]+)\]\(([^)]+)\)", "LINK"),
+    (r"\!\[([^\]]*)\]\(([^)]+)\)", "IMAGE"),
+    (r"\*\*[^*]+\*\*", "BOLD"),
+    (r"\*[^*]+\*", "ITALIC"),
+]
 
-API_BASE = "http://localhost:8000"
+# Max tokens per batch segment
+BATCH_MAX_TOKENS = 512
 
 
-# ── Backend startup (HF Spaces: only one process allowed) ───
-@st.cache_resource
-def start_backend():
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn",
-         "src.backend.api:app", "--host", "0.0.0.0", "--port", "8000"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    # Poll until backend is up (max 180s for NLLB to load)
-    for _ in range(180):
+class NLLBService:
+    SUPPORTED_LANGS = ["vie_Latn", "deu_Latn", "fra_Latn"]
+
+    # Human-readable display names for the frontend
+    LANG_DISPLAY = {
+        "vie_Latn": "Vietnamese (vie_Latn)",
+        "fra_Latn": "French (fra_Latn)",
+        "deu_Latn": "German (deu_Latn)",
+    }
+
+    def __init__(self, device=None, tgt_lang: str = "vie_Latn",
+                 adapter_path: str = "nllb-1.3B-multilingual-final",
+                 lazy_load: bool = False):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.loaded = False
+        self.src_lang = "eng_Latn"
+        self.tgt_lang = tgt_lang
+        self.model_name = "facebook/nllb-200-distilled-1.3B"
+        self.adapter_path = adapter_path
+        self._load_event = threading.Event()
+
+        if not lazy_load:
+            self.load_model()
+
+    def load_model(self):
+        if self.loaded:
+            return
         try:
-            requests.get(f"{API_BASE}/docs", timeout=1)
-            return proc
+            print(f"[NLLB] Loading {self.model_name} + LoRA adapter from {self.adapter_path}...")
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.adapter_path, src_lang=self.src_lang
+            )
+
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16 if self.device == "cuda" else torch.float16,
+            )
+
+            base_model = AutoModelForSeq2SeqLM.from_pretrained(
+                self.model_name,
+                quantization_config=bnb_config,
+                device_map="auto",
+                low_cpu_mem_usage=True,
+            )
+
+            padded = (len(self.tokenizer) + 63) // 64 * 64
+            base_model.resize_token_embeddings(padded, mean_resizing=False)
+
+            self.model = PeftModel.from_pretrained(base_model, self.adapter_path)
+            self.model.eval()
+
+            self.loaded = True
+            print("[NLLB] Model + LoRA adapter loaded successfully")
         except Exception:
-            time.sleep(1)
-    return proc  # return anyway, let requests fail naturally
+            import traceback
+            print("[NLLB] Load failed:")
+            traceback.print_exc()
+        finally:
+            self._load_event.set()
 
-start_backend()
+    def wait_for_load(self):
+        self._load_event.wait()
 
-# ── rest of file unchanged below ────────────────────────────
+    def set_target_lang(self, lang_code: str):
+        """Switch target language. Supports vie_Latn, deu_Latn, fra_Latn."""
+        if lang_code not in self.SUPPORTED_LANGS:
+            raise ValueError(f"Unsupported language: {lang_code}. Use one of {self.SUPPORTED_LANGS}")
+        self.tgt_lang = lang_code
 
-st.title("📄 Document Intelligent Machine Translation")
-st.caption("PDF → MinerU extraction → NLLB translation → Translated PDF + Markdown")
+    # ── Core translate ──────────────────────────────────────────────
 
-# ── Session State ───────────────────────────────────────────
-for key in ["doc_id", "original_markdown", "translated_markdown",
-            "agent_result", "pdf_ready", "has_middle"]:
-    if key not in st.session_state:
-        st.session_state[key] = None
+    def _translate_text(self, text: str) -> str:
+        """Translate a single string. Returns mock if model not loaded."""
+        if not text.strip():
+            return text
+        if not self.loaded:
+            return f"[{self.tgt_lang}] {text}"
 
-# ── Sidebar ─────────────────────────────────────────────────
-with st.sidebar:
-    st.header("⚙️ Settings")
-    uploaded_file = st.file_uploader("Upload PDF document", type=["pdf"])
-    st.slider("Max convert pages", 1, 200, 200)
-    st.selectbox("MinerU Engine", ["vlm", "pipeline"])
-    st.selectbox("Target Language", ["Vietnamese (vie_Latn)"])
+        self.tokenizer.src_lang = self.src_lang
+        self.tokenizer.tgt_lang = self.tgt_lang
 
-    st.divider()
-    col1, col2 = st.columns(2)
-    convert_btn = col1.button("🚀 Convert", use_container_width=True)
-    clear_btn = col2.button("🗑️ Clear", use_container_width=True)
-
-    st.divider()
-    st.subheader("🤖 AI Agent")
-    agent_btn = st.button("Run Agent Analysis", use_container_width=True)
-
-if clear_btn:
-    for key in st.session_state:
-        st.session_state[key] = None
-    st.rerun()
-
-# ── Pipeline Execution ─────────────────────────────────────
-if convert_btn and uploaded_file:
-    # Step 1: Upload & Extract
-    with st.spinner("📤 Uploading & extracting with MinerU..."):
-        files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
-        res = requests.post(f"{API_BASE}/upload", files=files)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get("status") == "success":
-                st.session_state.doc_id = data["doc_id"]
-                st.session_state.original_markdown = data["markdown"]
-                st.success(f"✅ Extraction complete (doc_id: {data['doc_id']})")
-            else:
-                st.error(f"❌ Extraction failed: {data.get('message')}")
-        else:
-            st.error(f"❌ API error: {res.status_code}")
-
-    # Step 2: Translate
-    if st.session_state.original_markdown and st.session_state.doc_id:
-        with st.spinner("🔄 Translating with NLLB-1.3B..."):
-            res = requests.post(
-                f"{API_BASE}/translate",
-                json={"doc_id": st.session_state.doc_id},
+        forced_bos_id = self.tokenizer.convert_tokens_to_ids(self.tgt_lang)
+        inputs = self.tokenizer(
+            text, return_tensors="pt", truncation=True, max_length=512
+        ).to(self.model.device)
+        with torch.no_grad():
+            out = self.model.generate(
+                **inputs,
+                forced_bos_token_id=forced_bos_id,
+                max_length=512,
+                num_beams=4,
             )
-            if res.status_code == 200:
-                data = res.json()
-                st.session_state.translated_markdown = data.get("translated_markdown")
-                st.session_state.has_middle = data.get("has_middle_json", False)
-                st.success("✅ Translation complete")
+        return self.tokenizer.batch_decode(out, skip_special_tokens=True)[0].strip()
 
-    # Step 3: Render PDF
-    if st.session_state.has_middle and st.session_state.doc_id:
-        with st.spinner("📄 Rendering translated PDF..."):
-            res = requests.post(
-                f"{API_BASE}/render-pdf",
-                json={"doc_id": st.session_state.doc_id},
+    def _translate_batch(self, texts: list[str]) -> list[str]:
+        """Q9: Translate a batch of strings for better GPU utilization."""
+        if not texts:
+            return []
+        if not self.loaded:
+            return [f"[{self.tgt_lang}] {t}" for t in texts]
+
+        self.tokenizer.src_lang = self.src_lang
+        self.tokenizer.tgt_lang = self.tgt_lang
+        forced_bos_id = self.tokenizer.convert_tokens_to_ids(self.tgt_lang)
+
+        inputs = self.tokenizer(
+            texts, return_tensors="pt", truncation=True,
+            max_length=512, padding=True
+        ).to(self.model.device)
+
+        with torch.no_grad():
+            out = self.model.generate(
+                **inputs,
+                forced_bos_token_id=forced_bos_id,
+                max_length=512,
+                num_beams=4,
             )
-            if res.status_code == 200 and res.json().get("status") == "success":
-                st.session_state.pdf_ready = True
-                st.success("✅ PDF rendered successfully")
+        results = self.tokenizer.batch_decode(out, skip_special_tokens=True)
+        return [r.strip() for r in results]
 
-# ── Agent ──────────────────────────────────────────────────
-if agent_btn and st.session_state.doc_id:
-    with st.spinner("🤖 Agent analyzing Q4 scores & extracting keywords..."):
-        res = requests.post(
-            f"{API_BASE}/agent",
-            json={"doc_id": st.session_state.doc_id},
+    # ── Paragraph extraction from layout.json ───────────────────────
+
+    def translate_middle_json(self, middle_data: dict) -> dict:
+        """
+        Translate all translatable content in layout.json in-place.
+
+        Uses para_blocks for paragraph-level grouping.
+        Respects merge_prev to concatenate continuation blocks.
+        Protects inline_equation spans with placeholders.
+        Q7: Handles cross_page spans via stitching + word-ratio split.
+        Q9: Batches paragraphs for efficient GPU throughput.
+        Returns a deep-copied middle_data with translated content.
+        """
+        t_start = time.time()
+        translated = copy.deepcopy(middle_data)
+        pages = translated.get("pdf_info", [])
+        total_pages = len(pages)
+
+        # Q7: Cross-page stitching
+        self._stitch_cross_page(pages)
+
+        all_jobs = []
+
+        for pi, page in enumerate(pages):
+            blocks = page.get("preproc_blocks", page.get("para_blocks", []))
+            jobs = self._collect_translation_jobs(blocks)
+            all_jobs.extend(jobs)
+            if (pi + 1) % 5 == 0 or pi == total_pages - 1:
+                print(f"[NLLB] Collected jobs from page {pi+1}/{total_pages} (total jobs: {len(all_jobs)})")
+
+        # Q9: Batch translate
+        if all_jobs:
+            print(f"[NLLB] Translating {len(all_jobs)} paragraphs...")
+            texts = [job[1] for job in all_jobs]
+
+            unique_texts = []
+            text_to_idx = {}
+            for text in texts:
+                if text not in text_to_idx:
+                    text_to_idx[text] = len(unique_texts)
+                    unique_texts.append(text)
+
+            translated_unique = []
+            batch = []
+            batch_tok_count = 0
+
+            for utext in unique_texts:
+                tok_count = len(utext.split())
+                if batch and batch_tok_count + tok_count > BATCH_MAX_TOKENS:
+                    translated_unique.extend(self._translate_batch(batch))
+                    batch = []
+                    batch_tok_count = 0
+                batch.append(utext)
+                batch_tok_count += tok_count
+
+            if batch:
+                translated_unique.extend(self._translate_batch(batch))
+
+            translated_texts = [translated_unique[text_to_idx[text]] for text in texts]
+
+            for i, (chain, _, eq_map) in enumerate(all_jobs):
+                tr = self._restore_equations(translated_texts[i], eq_map)
+                self._write_back_translated(chain, tr)
+
+            if (i + 1) % 50 == 0:
+                    print(f"[NLLB] Written back {i+1}/{len(all_jobs)} translations")
+
+        # Translate tables separately
+        for pi, page in enumerate(pages):
+            blocks = page.get("preproc_blocks", page.get("para_blocks", []))
+            for block in blocks:
+                if block.get("type") == "table":
+                    self._translate_table_block(block)
+
+        elapsed = time.time() - t_start
+        print(f"[NLLB] ✅ Layout translation complete in {elapsed:.1f}s ({len(all_jobs)} paragraphs)")
+        return translated
+
+    def _is_quartet_text(self, obj) -> bool:
+        if not isinstance(obj, dict): return False
+        return (
+            "bbox" in obj and
+            obj.get("type") == "text" and
+            "content" in obj and
+            isinstance(obj.get("score"), (int, float))
         )
-        if res.status_code == 200:
-            st.session_state.agent_result = res.json()
-            st.success("✅ Agent analysis complete")
 
-# ── Results Display ────────────────────────────────────────
-if st.session_state.translated_markdown:
-    st.header("📊 Results")
+    def _contains_quartet_recursive(self, obj) -> bool:
+        if self._is_quartet_text(obj):
+            return True
+        if isinstance(obj, dict):
+            for v in obj.values():
+                if self._contains_quartet_recursive(v): return True
+        elif isinstance(obj, list):
+            for item in obj:
+                if self._contains_quartet_recursive(item): return True
+        return False
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📝 Translated Markdown", "✏️ Editable Text", "🤖 Agent Analysis", "📥 Downloads"
-    ])
+    def _collect_translation_jobs(self, blocks: list) -> list:
+        jobs = []
+        i = 0
+        while i < len(blocks):
+            block = blocks[i]
 
-    start_edit_time = time.time()
+            if self._contains_quartet_recursive(block) or block.get("lines"):
+                chain = [block]
+                j = i + 1
+                while j < len(blocks) and blocks[j].get("merge_prev") is True:
+                    chain.append(blocks[j])
+                    j += 1
 
-    with tab1:
-        st.markdown(st.session_state.translated_markdown, unsafe_allow_html=True)
+                paragraph, eq_map = self._extract_paragraph(chain)
+                if paragraph.strip():
+                    jobs.append((chain, paragraph, eq_map))
 
-    with tab2:
-        edited_text = st.text_area(
-            "Edit translated markdown (feedback loop)",
-            st.session_state.translated_markdown,
-            height=500,
-        )
-        st.subheader("📊 Submit Evaluation")
-        rating = st.slider("Rate the translation quality (1-5)", 1, 5, 3)
-        downloaded = st.checkbox("Downloaded generated file?")
-        if st.button("📤 Submit Feedback & Save Metrics"):
-            time_consumed = time.time() - start_edit_time
-            res = requests.post(f"{API_BASE}/feedback", json={
-                "doc_id": st.session_state.doc_id,
-                "original_md": st.session_state.translated_markdown,
-                "modified_md": edited_text,
-                "user_rating": rating,
-                "downloaded": downloaded,
-                "time_consumed": time_consumed,
-            })
-            if res.status_code == 200:
-                st.success(f"✅ Metrics logged: {res.json()['metrics']}")
+                if "blocks" in block:
+                    jobs.extend(self._collect_translation_jobs(block["blocks"]))
 
-    with tab3:
-        if st.session_state.agent_result:
-            result = st.session_state.agent_result
-
-            # Q4 Verification
-            q4 = result.get("q4_verification", {})
-            st.subheader(f"🔍 Q4 Score Verification ({q4.get('q4_count', 0)} elements)")
-            if q4.get("threshold"):
-                st.caption(f"Score threshold (25th percentile): {q4['threshold']:.3f}")
-            for item in q4.get("results", [])[:20]:
-                icon = "✅" if item.get("verdict") == "OK" else "⚠️"
-                st.markdown(
-                    f"{icon} **[{item.get('index')}]** score={item.get('score', 'N/A'):.3f} "
-                    f"→ {item.get('verdict', 'N/A')} | `{item.get('content', '')[:60]}`"
-                )
-                if item.get("suggestion"):
-                    st.caption(f"  💡 {item['suggestion']}")
-
-            st.divider()
-
-            # Keywords & Wiki
-            st.subheader("🔑 Keywords & Wikipedia References")
-            keywords = result.get("keywords", [])
-            wiki = result.get("wiki_references", [])
-            if wiki:
-                for ref in wiki:
-                    st.markdown(f"- **{ref['keyword']}** → [{ref['url']}]({ref['url']})")
-            elif keywords:
-                st.write(", ".join(keywords))
+                i = j
+            elif "blocks" in block:
+                jobs.extend(self._collect_translation_jobs(block["blocks"]))
+                i += 1
             else:
-                st.info("No keywords extracted")
-        else:
-            st.info("Click 'Run Agent Analysis' in the sidebar to see results.")
+                i += 1
 
-    with tab4:
-        st.subheader("📥 Download & Preview")
+        return jobs
 
-        # Download translated markdown
-        if st.session_state.translated_markdown:
-            st.download_button(
-                "📄 Download Translated Markdown (.md)",
-                st.session_state.translated_markdown,
-                file_name="translated.md",
-                mime="text/markdown",
-            )
+    def _stitch_cross_page(self, pages: list):
+        """Q7: Cross-page stitching."""
+        for pi in range(len(pages) - 1):
+            current_blocks = pages[pi].get("para_blocks", [])
+            next_blocks = pages[pi + 1].get("para_blocks", [])
+            if not current_blocks or not next_blocks:
+                continue
 
-        # Download/Preview translated PDF
-        if st.session_state.pdf_ready and st.session_state.doc_id:
-            try:
-                pdf_res = requests.get(f"{API_BASE}/stream-pdf/{st.session_state.doc_id}")
-                if pdf_res.status_code == 200:
-                    import base64
-                    pdf_bytes = pdf_res.content
+            last_block = current_blocks[-1]
+            has_cross_page = False
+            for line in last_block.get("lines", []):
+                for span in line.get("spans", []):
+                    if span.get("cross_page", False):
+                        has_cross_page = True
+                        break
+                if has_cross_page:
+                    break
 
-                    st.divider()
-                    st.subheader("👁️ PDF Preview")
+            if has_cross_page:
+                first_next = next_blocks[0]
+                merged_lines = last_block.get("lines", []) + first_next.get("lines", [])
+                first_next["lines"] = merged_lines
+                first_next["_cross_page_merged"] = True
+                first_next["_original_page_line_count"] = len(last_block.get("lines", []))
+                last_block["lines"] = []
+                last_block["_merged_to_next"] = True
+                print(f"[NLLB] Cross-page stitch: page {pi} → page {pi+1}")
 
-                    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
-                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
-                    st.markdown(pdf_display, unsafe_allow_html=True)
+    def _extract_paragraph(self, block_chain: list) -> tuple:
+        parts = []
+        eq_map = {}
+        eq_idx = 0
 
-                    st.divider()
-                    st.download_button(
-                        "💾 Save Translated PDF",
-                        pdf_bytes,
-                        file_name=f"{st.session_state.doc_id}_translated.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
-                else:
-                    st.warning("PDF stream not available")
-            except Exception as e:
-                st.error(f"PDF preview error: {e}")
-        else:
-            st.info("PDF will be available after conversion with middle.json data")
+        for block in block_chain:
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    if self._is_quartet_text(span):
+                        parts.append(span["content"])
+                    elif span.get("type") == "inline_equation":
+                        placeholder = f"[EQ_{eq_idx}]"
+                        eq_map[placeholder] = span.get("content", "")
+                        parts.append(placeholder)
+                        eq_idx += 1
+                    elif span.get("type") == "interline_equation":
+                        placeholder = f"[EQ_{eq_idx}]"
+                        eq_map[placeholder] = span.get("content", "")
+                        parts.append(placeholder)
+                        eq_idx += 1
+                parts.append(" ")
+
+        return " ".join(parts).strip(), eq_map
+
+    def _restore_equations(self, text: str, eq_map: dict) -> str:
+        for placeholder, original in sorted(eq_map.items(), key=lambda x: len(x[0]), reverse=True):
+            text = text.replace(placeholder, original)
+        return text
+
+    def _write_back_translated(self, chain: list, translated_text: str):
+        translated_words = translated_text.split()
+        if not translated_words:
+            return
+
+        block_word_counts = []
+        total_orig_words = 0
+
+        for b in chain:
+            b_words = 0
+            for line in b.get("lines", []):
+                for span in line.get("spans", []):
+                    if self._is_quartet_text(span):
+                        b_words += len(span.get("content", "").split())
+
+            if b_words == 0 and b.get("merge_prev") is True:
+                b_words = 1
+
+            block_word_counts.append(b_words)
+            total_orig_words += b_words
+
+        word_idx = 0
+        for i, b in enumerate(chain):
+            if i == len(chain) - 1:
+                block_words = translated_words[word_idx:]
+            else:
+                ratio = block_word_counts[i] / total_orig_words
+                alloc_count = int(len(translated_words) * ratio)
+                block_words = translated_words[word_idx : word_idx + alloc_count]
+                word_idx += alloc_count
+
+            block_translated_text = " ".join(block_words)
+
+            b.pop("_merged", None)
+
+            if block_translated_text:
+                b["lines"] = [{
+                    "bbox": b.get("bbox", [0, 0, 0, 0]),
+                    "spans": [{
+                        "bbox": b.get("bbox", [0, 0, 0, 0]),
+                        "type": "text",
+                        "content": block_translated_text,
+                        "score": 1.0,
+                        "translated": True,
+                    }]
+                }]
+            else:
+                b["lines"] = [{
+                    "bbox": b.get("bbox", [0, 0, 0, 0]),
+                    "spans": [{
+                        "bbox": b.get("bbox", [0, 0, 0, 0]),
+                        "type": "text",
+                        "content": " ",
+                        "score": 1.0,
+                        "translated": True,
+                    }]
+                }]
+
+    # ── Table translation ────────────────────────────────────────────
+
+    def _translate_table_block(self, block: dict):
+        for sub in block.get("blocks", []):
+            for line in sub.get("lines", []):
+                for span in line.get("spans", []):
+                    if span.get("type") == "table" and "html" in span:
+                        span["html"] = self._translate_table_html(span["html"])
+
+    def _translate_table_html(self, html: str) -> str:
+        def replace_cell(match):
+            tag = match.group(1)
+            content = match.group(2)
+            close = match.group(3)
+
+            eq_map = {}
+            eq_idx = 0
+            def protect_eq(m):
+                nonlocal eq_idx
+                key = f"[TEQ_{eq_idx}]"
+                eq_map[key] = m.group(0)
+                eq_idx += 1
+                return key
+            protected = re.sub(r"<eq>.*?</eq>", protect_eq, content)
+
+            text_only = re.sub(r"<[^>]+>", "", protected).strip()
+            if text_only:
+                translated = self._translate_text(protected)
+                for k, v in eq_map.items():
+                    translated = translated.replace(k, v)
+                return f"<{tag}>{translated}</{close}>"
+            return match.group(0)
+
+        return re.sub(
+            r"<(t[dh][^>]*)>(.*?)</(t[dh])>",
+            replace_cell,
+            html,
+            flags=re.DOTALL,
+        )
+
+    # ── Markdown-level translation ───────────────────────────────────
+
+    def translate_markdown(self, md_content: str) -> str:
+        lines = md_content.split("\n")
+        total_lines = len(lines)
+        translated_lines = []
+        print(f"[NLLB] Translating markdown ({total_lines} lines)...")
+
+        for li, line in enumerate(lines):
+            if not line.strip():
+                translated_lines.append("")
+                continue
+            if line.strip().startswith("\\[") or line.strip().startswith("$$") or line.strip().startswith("```"):
+                translated_lines.append(line)
+                continue
+
+            protected_text, mapping = self._protect(line)
+            translated_text = self._translate_text(protected_text)
+            final_text = self._restore(translated_text, mapping)
+            translated_lines.append(final_text)
+
+            if (li + 1) % 20 == 0:
+                print(f"[NLLB] Markdown: {li+1}/{total_lines} lines translated")
+
+        print(f"[NLLB] ✅ Markdown translation complete ({total_lines} lines)")
+        return "\n".join(translated_lines)
+
+    def _protect(self, text: str) -> tuple:
+        from collections import defaultdict
+        placeholders = {}
+        counts = defaultdict(int)
+
+        all_matches = []
+        for pattern, tag in PROTECTED_PATTERNS:
+            for m in re.finditer(pattern, text):
+                all_matches.append((m.start(), m.end(), m.group(), tag))
+
+        all_matches.sort(key=lambda x: (x[0], -x[1]))
+        filtered = []
+        last_end = -1
+        for s, e, c, t in all_matches:
+            if s >= last_end:
+                filtered.append((s, e, c, t))
+                last_end = e
+
+        result = text
+        for s, e, c, t in sorted(filtered, key=lambda x: x[0], reverse=True):
+            idx = counts[t]
+            ph = f"[{t}_{idx}]"
+            counts[t] += 1
+            placeholders[ph] = c
+            result = result[:s] + ph + result[e:]
+
+        return result, placeholders
+
+    def _restore(self, text: str, placeholders: dict) -> str:
+        for ph, orig in sorted(placeholders.items(), key=lambda x: len(x[0]), reverse=True):
+            text = text.replace(ph, orig)
+        return text
