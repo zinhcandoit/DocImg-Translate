@@ -1,586 +1,534 @@
 """
-FastAPI Backend — Production pipeline API.
+Streamlit Frontend — DIMT Document Translation Pipeline.
 
-Endpoints:
-  POST /upload                  — Upload PDF → MinerU extraction (STEP 0: SHA-256 dedup)
-  POST /translate               — Translate via NLLB + build bilingual mapping
-  POST /render-pdf              — Render translated PDF from layout.json + images
-  POST /agent/verify            — AI agent: Q4 score verification only
-  POST /agent/keywords          — AI agent: keyword extraction + WikiSearch URLs
-  POST /agent/table-recovery    — AI agent: patch untranslated blocks (Bước 3)
-  POST /feedback                — Log user metrics to MLflow
-  GET  /download/{id}           — Download rendered PDF
-  GET  /stream-pdf/{id}         — Stream PDF for preview
-  POST /hitl/update             — Human-in-the-Loop: update flagged translation
-  GET  /bilingual/{id}          — Retrieve bilingual mapping pairs (Bước 6)
+Features:
+- Upload PDF → Extract via MinerU → Translate via NLLB
+- Optional "Human Check" mode: Q4 verification + HITL editing before translation
+- Rendered markdown preview + editable text area (notebook-style blocks)
+- Download translated PDF (rendered from layout.json + images)
+- References tab: keyword WikiSearch links
+- Q6: Human-in-the-Loop (HITL) editable UI for flagged elements
+- User feedback with MLflow metrics logging
 """
 
-import json
-import uuid
+import subprocess
+import sys
 import time
-import asyncio
-import traceback
-from contextlib import asynccontextmanager
-from pathlib import Path
-from fastapi import FastAPI, UploadFile, Form
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
+import concurrent.futures
+import streamlit as st
+import requests
 
-from .mineru_client import MinerUClient
-from .nllb_service import NLLBService
-from .agent import AIAgent
-from .evaluation import Evaluator
-from .pdf_renderer import PDFRenderer
-from .mongo_store import MongoDocStore
-from .dedup_cache import lookup_cache, register_cache
-from .bilingual_mapping import (
-    build_bilingual_mapping,
-    save_bilingual_mapping,
-    load_bilingual_mapping,
-    apply_hitl_edit_to_mapping,
-)
+st.set_page_config(layout="wide", page_title="DIMT — Document Translation", page_icon="📄")
 
-# ── Services ─────────────────────────────────────────────────
-mineru = MinerUClient()
-nllb = NLLBService(lazy_load=True)
-agent = AIAgent()
-evaluator = Evaluator()
+API_BASE = "http://localhost:8000"
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("[API] Starting background NLLB model loading...")
-    asyncio.create_task(asyncio.to_thread(nllb.load_model))
-    yield
-    print("[API] Shutting down.")
+# Generous timeout for long operations (translation can take minutes)
+LONG_TIMEOUT = 600  # 10 minutes
 
-app = FastAPI(title="DIMT — Document Intelligent Machine Translation", lifespan=lifespan)
+# ── Language options ─────────────────────────────────────────────────
+# Order: Vietnamese first (primary target), then French, German
+LANG_OPTIONS = [
+    "Vietnamese (vie_Latn)",
+    "French (fra_Latn)",
+    "German (deu_Latn)",
+]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
-
-doc_store = MongoDocStore()
-gpu_semaphore = asyncio.Semaphore(1)
-
-OUTPUT_DIR = Path("output")
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-MAX_MINERU_PAGES = 200
+LANG_CODE_MAP = {
+    "Vietnamese (vie_Latn)": "vie_Latn",
+    "French (fra_Latn)": "fra_Latn",
+    "German (deu_Latn)": "deu_Latn",
+}
 
 
-# ── Models ──────────────────────────────────────────────────
-class TranslateRequest(BaseModel):
-    doc_id: str
-    tgt_lang: str = "vie_Latn"
+# ── Backend startup (HF Spaces: only one process allowed) ───
+@st.cache_resource
+def start_backend():
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn",
+         "src.backend.api:app", "--host", "0.0.0.0", "--port", "8000"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    for _ in range(180):
+        try:
+            requests.get(f"{API_BASE}/docs", timeout=1)
+            return proc
+        except Exception:
+            time.sleep(1)
+    return proc
 
-class RenderRequest(BaseModel):
-    doc_id: str
+start_backend()
 
-class AgentRequest(BaseModel):
-    doc_id: str
-    llm_provider: str = "deepseek"
+st.title("📄 Document Intelligent Machine Translation")
+st.caption("PDF → MinerU extraction → NLLB translation → Translated PDF + Markdown")
 
-class FeedbackRequest(BaseModel):
-    doc_id: str
-    original_md: str
-    modified_md: str
-    user_rating: int
-    downloaded: bool
-    time_consumed: float
+# ── Session State ───────────────────────────────────────────
+for key in ["doc_id", "original_markdown", "translated_markdown",
+            "agent_result", "pdf_ready", "has_middle", "hitl_blocks",
+            "q4_result", "human_check", "q4_confirmed",
+            "keywords_result", "num_pages", "num_paragraphs"]:
+    if key not in st.session_state:
+        st.session_state[key] = 0 if "num_" in key else None
 
-class HITLUpdateRequest(BaseModel):
-    doc_id: str
-    page_idx: int
-    block_idx: int
-    new_text: str
+# ── Sidebar ─────────────────────────────────────────────────
+with st.sidebar:
+    st.header("⚙️ Settings")
+    uploaded_file = st.file_uploader("Upload PDF document", type=["pdf"])
+    st.slider("Max convert pages", 1, 200, 200)
+    st.selectbox("MinerU Engine", ["vlm", "pipeline"])
 
+    target_lang = st.selectbox(
+        "Target Language",
+        LANG_OPTIONS,
+        index=0,  # Vietnamese is default
+    )
+    tgt_lang_code = LANG_CODE_MAP[target_lang]
 
-# ── Helpers ─────────────────────────────────────────────────
+    agent_llm = st.selectbox("Agent LLM", ["DeepSeek", "Gemini"])
+    agent_llm_code = "gemini" if agent_llm == "Gemini" else "deepseek"
 
-def _count_pdf_pages(pdf_path: Path) -> int:
-    import fitz
-    doc = fitz.open(str(pdf_path))
-    count = len(doc)
-    doc.close()
-    return count
+    st.divider()
+    human_check = st.checkbox("🔍 Human Check", value=False,
+                              help="Enable Q4 verification & HITL editing before translation")
+    col1, col2 = st.columns(2)
+    convert_btn = col1.button("🚀 Convert", use_container_width=True)
+    clear_btn = col2.button("🗑️ Clear", use_container_width=True)
 
-def _split_pdf(pdf_path: Path, chunk_size: int = MAX_MINERU_PAGES) -> list[Path]:
-    import fitz
-    doc = fitz.open(str(pdf_path))
-    total = len(doc)
-    if total <= chunk_size:
-        doc.close()
-        return [pdf_path]
-
-    chunks = []
-    for start in range(0, total, chunk_size):
-        end = min(start + chunk_size - 1, total - 1)
-        chunk_doc = fitz.open()
-        chunk_doc.insert_pdf(doc, from_page=start, to_page=end)
-        chunk_path = pdf_path.parent / f"{pdf_path.stem}_chunk_{start}_{end}.pdf"
-        chunk_doc.save(str(chunk_path))
-        chunk_doc.close()
-        chunks.append(chunk_path)
-        print(f"[API] Split chunk: pages {start}-{end} → {chunk_path.name}")
-
-    doc.close()
-    return chunks
-
-def _count_paragraphs(layout_data: dict) -> int:
-    if not layout_data: return 0
-    count = 0
-    for page in layout_data.get("pdf_info", []):
-        blocks = page.get("preproc_blocks", page.get("para_blocks", []))
-        count += len(blocks)
-    return count
-
-def _merge_layout_jsons(layouts: list[dict]) -> dict:
-    merged = {"pdf_info": []}
-    page_offset = 0
-    for layout in layouts:
-        for page in layout.get("pdf_info", []):
-            page_copy = dict(page)
-            page_copy["page_idx"] = page_offset + page.get("page_idx", 0)
-            merged["pdf_info"].append(page_copy)
-        page_offset += len(layout.get("pdf_info", []))
-    return merged
+if clear_btn:
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()
 
 
-# ── Endpoints ───────────────────────────────────────────────
+# ── Helper: run translate + render sequentially ─────────────
+def _run_translate_and_render(doc_id, tgt_lang, num_paras=0, num_pages=0):
+    """Called in a thread — translate then render with dynamic timeout."""
+    dynamic_timeout = (num_paras * 20) + (num_pages * 5) + 600
+    if dynamic_timeout < LONG_TIMEOUT:
+        dynamic_timeout = LONG_TIMEOUT
 
-@app.post("/upload")
-async def upload_file(file: UploadFile):
-    """
-    Upload PDF → extract via MinerU.
+    tr = requests.post(
+        f"{API_BASE}/translate",
+        json={"doc_id": doc_id, "tgt_lang": tgt_lang},
+        timeout=dynamic_timeout,
+    )
+    tr_data = tr.json() if tr.status_code == 200 else {}
+    if tr_data.get("status") != "success":
+        return {"status": "error", "step": "translate", "data": tr_data}
 
-    STEP 0: SHA-256 dedup check.
-      - Cache hit  → skip MinerU entirely, return cached doc_id + cached=True
-      - Cache miss → run full MinerU extraction, register result in cache
-    Auto-splits PDFs >200 pages before sending to MinerU.
-    """
-    print(f"\n{'='*60}")
-    print(f"[API] /upload — file={file.filename}")
+    if tr_data.get("has_middle_json"):
+        rr = requests.post(
+            f"{API_BASE}/render-pdf",
+            json={"doc_id": doc_id},
+            timeout=dynamic_timeout,
+        )
+        rr_data = rr.json() if rr.status_code == 200 else {}
+        return {"status": "success", "translate": tr_data, "render": rr_data}
 
-    content = await file.read()
+    return {"status": "success", "translate": tr_data, "render": None}
 
-    # ── STEP 0: Deduplication ────────────────────────────────
-    cached_doc_id, cached_doc = lookup_cache(content, doc_store)
-    if cached_doc_id is not None:
-        evaluator.start_inference(cached_doc_id)
-        evaluator.end_inference(cached_doc_id)
-        return {
-            "status": "success",
-            "doc_id": cached_doc_id,
-            "num_pages": cached_doc.get("num_pages", 0),
-            "num_paragraphs": cached_doc.get("num_paragraphs", 0),
-            "cached": True,
-        }
 
-    # ── New document — full pipeline ─────────────────────────
-    doc_id = str(uuid.uuid4())[:8]
-    evaluator.start_inference(doc_id)
-    print(f"[API] New doc — doc_id={doc_id}")
+def _run_keywords(doc_id, llm_provider="deepseek"):
+    """Called in a thread — extract keywords (shorter timeout, not GPU-bound)."""
+    res = requests.post(
+        f"{API_BASE}/agent/keywords",
+        json={"doc_id": doc_id, "llm_provider": llm_provider},
+        timeout=120,
+    )
+    return res.json() if res.status_code == 200 else {}
 
-    input_dir = Path("input_docs")
-    input_dir.mkdir(exist_ok=True)
-    save_path = input_dir / file.filename
-    save_path.write_bytes(content)
-    print(f"[API] Saved {len(content)} bytes → {save_path}")
 
-    page_count = _count_pdf_pages(save_path)
-    print(f"[API] PDF has {page_count} pages")
+# ── Pipeline Execution ─────────────────────────────────────
+if convert_btn and uploaded_file:
+    # Step 1: Upload & Extract
+    with st.spinner("📤 Uploading & extracting with MinerU..."):
+        try:
+            files = {"file": (uploaded_file.name, uploaded_file.getvalue())}
+            res = requests.post(f"{API_BASE}/upload", files=files, timeout=LONG_TIMEOUT)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "success":
+                    st.session_state.doc_id = data["doc_id"]
+                    st.session_state.num_pages = data.get("num_pages", 0)
+                    st.session_state.num_paragraphs = data.get("num_paragraphs", 0)
+                    st.session_state.human_check = human_check
+                    st.session_state.q4_confirmed = False
 
-    if page_count > MAX_MINERU_PAGES:
-        print(f"[API] Large PDF ({page_count} pages). Auto-splitting into chunks of {MAX_MINERU_PAGES}...")
-        chunks = _split_pdf(save_path)
-        all_layouts = []
-        all_markdowns = []
-        images_dir = None
-        extract_dir = None
-
-        for i, chunk_path in enumerate(chunks):
-            print(f"[API] Extracting chunk {i+1}/{len(chunks)}: {chunk_path.name}")
-            res = await asyncio.to_thread(mineru.extract_from_file, str(chunk_path))
-            if res["status"] == "success":
-                all_markdowns.append(res.get("markdown", ""))
-                if res.get("middle_json"):
-                    all_layouts.append(res["middle_json"])
-                if not images_dir:
-                    images_dir = res.get("images_dir")
-                if not extract_dir:
-                    extract_dir = res.get("extract_dir")
+                    cached = data.get("cached", False)
+                    cache_msg = " (từ cache 🗄️)" if cached else ""
+                    st.success(
+                        f"✅ Extraction complete{cache_msg} (ID: {data['doc_id']}) — "
+                        f"Found {st.session_state.num_pages} pages, "
+                        f"{st.session_state.num_paragraphs} paragraphs"
+                    )
+                else:
+                    st.error(f"❌ Extraction failed: {data.get('message')}")
             else:
-                print(f"[API] ⚠️ Chunk {i+1} extraction failed: {res.get('message')}")
+                st.error(f"❌ API error: {res.status_code} — {res.text[:200]}")
+        except requests.exceptions.Timeout:
+            st.error("❌ Upload timed out. The PDF may be too large.")
+        except requests.exceptions.ConnectionError:
+            st.error("❌ Cannot connect to backend. Is the server running?")
 
-        merged_md = "\n\n---\n\n".join(all_markdowns)
-        merged_layout = _merge_layout_jsons(all_layouts) if all_layouts else None
-        p_count = _count_paragraphs(merged_layout)
+    # Step 2: Human Check → Q4 verification
+    if st.session_state.human_check and st.session_state.doc_id:
+        with st.spinner("🔍 Running Q4 verification (Agent)..."):
+            try:
+                res = requests.post(
+                    f"{API_BASE}/agent/verify",
+                    json={"doc_id": st.session_state.doc_id, "llm_provider": agent_llm_code},
+                    timeout=LONG_TIMEOUT,
+                )
+                if res.status_code == 200:
+                    result = res.json()
+                    if result.get("status") == "success":
+                        st.session_state.q4_result = result.get("q4_verification", {})
+                        st.success("✅ Q4 verification complete — review flagged elements below")
+                    else:
+                        st.error(f"❌ Q4 verification failed: {result.get('message')}")
+            except requests.exceptions.Timeout:
+                st.error("❌ Q4 verification timed out.")
+            except requests.exceptions.ConnectionError:
+                st.error("❌ Cannot connect to backend.")
 
-        doc_data = {
-            "filename": file.filename,
-            "markdown": merged_md,
-            "middle_json": merged_layout,
-            "images_dir": images_dir,
-            "extract_dir": extract_dir,
-            "num_pages": page_count,
-            "num_paragraphs": p_count,
-        }
-        doc_store.set(doc_id, doc_data)
-        register_cache(content, doc_id, doc_store)
+    # Step 2b: No Human Check → translate+render+keywords in parallel
+    if not st.session_state.human_check and st.session_state.doc_id:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
-        print(f"[API] ✅ Large PDF extraction complete. {len(all_layouts)} chunks merged.")
-        return {
-            "status": "success",
-            "doc_id": doc_id,
-            "num_pages": page_count,
-            "num_paragraphs": p_count,
-            "cached": False,
-        }
+        dynamic_timeout = (st.session_state.num_paragraphs * 20) + (st.session_state.num_pages * 5) + 600
+        if dynamic_timeout < LONG_TIMEOUT:
+            dynamic_timeout = LONG_TIMEOUT
 
-    # Normal extraction for ≤200-page PDFs
-    print(f"[API] Calling MinerU API...")
-    res = await asyncio.to_thread(mineru.extract_from_file, str(save_path))
+        fut_pipeline = executor.submit(
+            _run_translate_and_render,
+            st.session_state.doc_id, tgt_lang_code,
+            st.session_state.num_paragraphs, st.session_state.num_pages
+        )
+        fut_keywords = executor.submit(
+            _run_keywords, st.session_state.doc_id, agent_llm_code
+        )
 
-    if res["status"] == "success":
-        m_json = res.get("middle_json")
-        p_count = _count_paragraphs(m_json)
-        doc_data = {
-            "filename": file.filename,
-            "markdown": res["markdown"],
-            "middle_json": m_json,
-            "images_dir": res.get("images_dir"),
-            "extract_dir": res.get("extract_dir"),
-            "num_pages": page_count,
-            "num_paragraphs": p_count,
-        }
-        doc_store.set(doc_id, doc_data)
-        register_cache(content, doc_id, doc_store)
+        with st.spinner("🔄 Translating & rendering PDF... (this may take several minutes)"):
+            try:
+                pipeline_result = fut_pipeline.result(timeout=dynamic_timeout)
+                if pipeline_result.get("status") == "success":
+                    tr_data = pipeline_result.get("translate", {})
+                    st.session_state.translated_markdown = tr_data.get("translated_markdown", "")
+                    st.session_state.has_middle = tr_data.get("has_middle_json", False)
+                    rr_data = pipeline_result.get("render")
+                    if rr_data and rr_data.get("status") == "success":
+                        st.session_state.pdf_ready = True
+                    st.success("✅ Translation & PDF rendering complete")
+                else:
+                    st.error(f"❌ Pipeline failed at {pipeline_result.get('step', 'unknown')}")
+            except concurrent.futures.TimeoutError:
+                st.error(f"❌ Translation pipeline timed out after {dynamic_timeout}s.")
+            except Exception as e:
+                st.error(f"❌ Translation pipeline error: {e}")
 
-        print(f"[API] ✅ Extraction complete. MD length={len(res['markdown'])}, "
-              f"has_layout={m_json is not None}")
-        return {
-            "status": "success",
-            "doc_id": doc_id,
-            "num_pages": page_count,
-            "num_paragraphs": p_count,
-            "cached": False,
-        }
+        with st.spinner("📚 Extracting keywords & references..."):
+            try:
+                kw_result = fut_keywords.result(timeout=120)
+                if kw_result.get("status") == "success":
+                    st.session_state.keywords_result = kw_result
+                    st.success("✅ Keywords extracted")
+            except concurrent.futures.TimeoutError:
+                st.info("📚 Keywords extraction timed out. Use the retry button in References tab.")
+            except Exception as e:
+                st.warning(f"⚠️ Keywords error: {e}")
 
-    print(f"[API] ❌ Extraction failed: {res.get('message')}")
-    return {"status": "error", "message": res.get("message", "Extraction failed")}
-
-
-@app.post("/translate")
-async def translate_document(req: TranslateRequest):
-    """Translate document using NLLB — paragraph-level from layout.json with batch translation."""
-    print(f"\n{'='*60}")
-    print(f"[API] /translate — doc_id={req.doc_id}, tgt_lang={req.tgt_lang}")
-    t_start = time.time()
-
-    if not nllb.loaded:
-        print("[API] NLLB is still loading. Waiting...")
-        await asyncio.to_thread(nllb.wait_for_load)
-        if not nllb.loaded:
-            print("[API] ⚠️ NLLB failed to load. Translations will be mock.")
-
-    doc = doc_store.get(req.doc_id)
-    if not doc:
-        print(f"[API] ❌ Document {req.doc_id} not found")
-        return {"status": "error", "message": "Document not found"}
-
-    if req.tgt_lang in NLLBService.SUPPORTED_LANGS:
-        nllb.set_target_lang(req.tgt_lang)
-        # Sync target lang to agent so wiki URLs use right language
-        agent.target_lang = req.tgt_lang
-        print(f"[API] Target language set to {req.tgt_lang}")
-
-    middle_data = doc.get("middle_json")
-    translated_md = ""
-    translated_middle = None
-
-    async with gpu_semaphore:
-        print("[API] GPU semaphore acquired. Starting translation...")
-        if middle_data:
-            page_count = len(middle_data.get("pdf_info", []))
-            print(f"[API] Translating layout.json ({page_count} pages)...")
-            translated_middle = await asyncio.to_thread(
-                nllb.translate_middle_json, middle_data
-            )
-            doc["translated_middle"] = translated_middle
-
-    elapsed = time.time() - t_start
-    doc["translated_md"] = translated_md
-    doc_store.update(req.doc_id, doc)
-    evaluator.end_inference(req.doc_id)
-
-    print(f"[API] ✅ Translation complete in {elapsed:.1f}s.")
-
-    return {
-        "status": "success",
-        "translated_markdown": translated_md,
-        "has_middle_json": middle_data is not None,
-    }
+        executor.shutdown(wait=False)
 
 
-@app.post("/render-pdf")
-async def render_pdf(req: RenderRequest):
-    """Render translated PDF from translated layout.json + images."""
-    print(f"\n{'='*60}")
-    print(f"[API] /render-pdf — doc_id={req.doc_id}")
-    t_start = time.time()
+# ── HITL Review & Confirm ────────────────────────────────────
+if (st.session_state.human_check
+    and st.session_state.q4_result
+    and not st.session_state.q4_confirmed):
 
-    doc = doc_store.get(req.doc_id)
-    if not doc:
-        return {"status": "error", "message": "Document not found"}
+    st.header("🔍 Q4 Verification — Review Flagged Elements")
+    q4 = st.session_state.q4_result
 
-    translated_middle = doc.get("translated_middle")
-    middle_data = doc.get("middle_json")
-    layout_data = translated_middle or middle_data
-    if not layout_data:
-        return {"status": "error", "message": "No layout.json found. Run translation first."}
+    st.info(f"Found **{q4.get('q4_count', 0)}** elements in the bottom 25th percentile. "
+            f"Threshold: {q4.get('threshold', 'N/A')}")
 
-    input_dir = Path("input_docs")
-    origin_pdf_path = input_dir / doc["filename"]
-    if not origin_pdf_path.exists():
-        return {"status": "error", "message": f"Origin PDF not found: {origin_pdf_path}"}
+    for i, item in enumerate(q4.get("results", [])[:20]):
+        icon = "✅" if item.get("verdict") == "OK" else "⚠️"
+        score_val = item.get('score', 'N/A')
+        score_str = f"{score_val:.3f}" if isinstance(score_val, (int, float)) else str(score_val)
 
-    images_dir = doc.get("images_dir")
-    renderer = PDFRenderer(images_dir=images_dir)
+        with st.expander(
+            f"{icon} [{item.get('index')}] score={score_str} → {item.get('verdict', 'N/A')} "
+            f"| `{item.get('content', '')[:60]}`",
+            expanded=(item.get("verdict") == "REVIEW"),
+        ):
+            if item.get("suggestion"):
+                st.caption(f"💡 {item['suggestion']}")
 
-    output_path = OUTPUT_DIR / f"{req.doc_id}_translated.pdf"
-    print(f"[API] Rendering PDF → {output_path}")
-
-    try:
-        async with gpu_semaphore:
-            await asyncio.to_thread(
-                renderer.render, layout_data, str(origin_pdf_path), str(output_path)
-            )
-    except Exception as e:
-        print(f"[API] ❌ Render error: {e}")
-        traceback.print_exc()
-        return {"status": "error", "message": f"Render failed: {e}"}
-
-    elapsed = time.time() - t_start
-    doc["pdf_path"] = str(output_path)
-    doc_store.update(req.doc_id, doc)
-    print(f"[API] ✅ PDF rendered in {elapsed:.1f}s → {output_path}")
-    return {"status": "success", "pdf_path": str(output_path)}
+    st.divider()
+    if st.button("✅ Confirm & Continue Pipeline", use_container_width=True, type="primary"):
+        st.session_state.q4_confirmed = True
+        st.rerun()
 
 
-@app.get("/stream-pdf/{doc_id}")
-async def stream_pdf(doc_id: str):
-    doc = doc_store.get(doc_id)
-    if not doc or "pdf_path" not in doc:
-        return JSONResponse({"status": "error", "message": "PDF not found"}, status_code=404)
-    pdf_path = Path(doc["pdf_path"])
-    if not pdf_path.exists():
-        return JSONResponse({"status": "error", "message": "PDF file missing"}, status_code=404)
-    return FileResponse(str(pdf_path), media_type="application/pdf")
+# ── After Confirm: translate+render+keywords in parallel ─────
+if (st.session_state.human_check
+    and st.session_state.q4_confirmed
+    and st.session_state.doc_id
+    and st.session_state.translated_markdown is None):
 
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 
-@app.get("/download/{doc_id}")
-async def download_pdf(doc_id: str):
-    doc = doc_store.get(doc_id)
-    if not doc or "pdf_path" not in doc:
-        return JSONResponse({"status": "error", "message": "PDF not found"}, status_code=404)
-    return FileResponse(
-        doc["pdf_path"],
-        media_type="application/pdf",
-        filename=f"{Path(doc.get('filename', 'translated')).stem}_translated.pdf",
+    dynamic_timeout = (st.session_state.num_paragraphs * 20) + (st.session_state.num_pages * 5) + 600
+    if dynamic_timeout < LONG_TIMEOUT:
+        dynamic_timeout = LONG_TIMEOUT
+
+    fut_pipeline = executor.submit(
+        _run_translate_and_render,
+        st.session_state.doc_id, tgt_lang_code,
+        st.session_state.num_paragraphs, st.session_state.num_pages
+    )
+    fut_keywords = executor.submit(
+        _run_keywords, st.session_state.doc_id, agent_llm_code
     )
 
+    with st.spinner("🔄 Translating & rendering PDF... (this may take several minutes)"):
+        try:
+            pipeline_result = fut_pipeline.result(timeout=dynamic_timeout)
+            if pipeline_result.get("status") == "success":
+                tr_data = pipeline_result.get("translate", {})
+                st.session_state.translated_markdown = tr_data.get("translated_markdown", "")
+                st.session_state.has_middle = tr_data.get("has_middle_json", False)
+                rr_data = pipeline_result.get("render")
+                if rr_data and rr_data.get("status") == "success":
+                    st.session_state.pdf_ready = True
+                st.success("✅ Translation & PDF rendering complete")
+            else:
+                st.error(f"❌ Pipeline failed at {pipeline_result.get('step', 'unknown')}")
+        except concurrent.futures.TimeoutError:
+            st.error(f"❌ Translation pipeline timed out after {dynamic_timeout}s.")
+        except Exception as e:
+            st.error(f"❌ Translation pipeline error: {e}")
 
-# ── Agent: Q4 Verification ──────────────────────────────────
+    with st.spinner("📚 Extracting keywords & references..."):
+        try:
+            kw_result = fut_keywords.result(timeout=120)
+            if kw_result.get("status") == "success":
+                st.session_state.keywords_result = kw_result
+                st.success("✅ Keywords extracted")
+        except concurrent.futures.TimeoutError:
+            st.info("📚 Keywords extraction timed out. Use the retry button in References tab.")
+        except Exception as e:
+            st.warning(f"⚠️ Keywords error: {e}")
 
-@app.post("/agent/verify")
-async def agent_verify(req: AgentRequest):
-    print(f"\n{'='*60}")
-    print(f"[API] /agent/verify — doc_id={req.doc_id}")
-    t_start = time.time()
+    executor.shutdown(wait=False)
 
-    doc = doc_store.get(req.doc_id)
-    if not doc:
-        return {"status": "error", "message": "Document not found"}
-
-    layout_data = doc.get("middle_json", {})
-
-    try:
-        agent.set_llm_provider(req.llm_provider)
-        q4_result = await asyncio.to_thread(agent.verify_q4_elements, layout_data)
-        doc["agent_result"] = {"q4_verification": q4_result}
-        doc_store.update(req.doc_id, doc)
-        elapsed = time.time() - t_start
-        print(f"[API] ✅ Q4 verification complete in {elapsed:.1f}s. Q4 elements={q4_result.get('q4_count', 0)}")
-        return {"status": "success", "q4_verification": q4_result}
-    except Exception as e:
-        print(f"[API] ❌ Agent verify error: {e}")
-        traceback.print_exc()
-        return {"status": "error", "message": f"Agent verify failed: {e}"}
-
-
-# ── Agent: Keywords ─────────────────────────────────────────
-
-@app.post("/agent/keywords")
-async def agent_keywords(req: AgentRequest):
-    print(f"\n{'='*60}")
-    print(f"[API] /agent/keywords — doc_id={req.doc_id}")
-    t_start = time.time()
-
-    doc = doc_store.get(req.doc_id)
-    if not doc:
-        return {"status": "error", "message": "Document not found"}
-
-    markdown = doc.get("markdown", "")
-
-    try:
-        agent.set_llm_provider(req.llm_provider)
-        keywords = await asyncio.to_thread(agent.extract_keywords, markdown)
-        wiki_urls = agent.get_keyword_wiki_urls(keywords)
-
-        agent_result = doc.get("agent_result", {})
-        agent_result["keywords"] = keywords
-        agent_result["wiki_references"] = wiki_urls
-        doc["agent_result"] = agent_result
-        doc_store.update(req.doc_id, doc)
-
-        elapsed = time.time() - t_start
-        print(f"[API] ✅ Keywords complete in {elapsed:.1f}s. keywords={len(keywords)}")
-        return {"status": "success", "keywords": keywords, "wiki_references": wiki_urls}
-    except Exception as e:
-        print(f"[API] ❌ Agent keywords error: {e}")
-        traceback.print_exc()
-        return {"status": "error", "message": f"Agent keywords failed: {e}"}
+    # Fetch HITL blocks after translation
+    if st.session_state.has_middle:
+        try:
+            hitl_res = requests.get(
+                f"{API_BASE}/hitl/blocks/{st.session_state.doc_id}",
+                timeout=30,
+            )
+            if hitl_res.status_code == 200:
+                st.session_state.hitl_blocks = hitl_res.json().get("flagged_blocks", [])
+        except Exception:
+            pass
 
 
-# ── Legacy combined agent endpoint ──────────────────────────
+# ── Results Display ────────────────────────────────────────
+if st.session_state.translated_markdown is not None:
+    st.header("📊 Results")
 
-@app.post("/agent")
-async def run_agent(req: AgentRequest):
-    print(f"\n{'='*60}")
-    print(f"[API] /agent — doc_id={req.doc_id}")
-    t_start = time.time()
+    if st.session_state.human_check:
+        tab_names = ["📝 Translated Markdown", "✏️ Editable Text",
+                     "🔧 HITL Verification", "📚 References", "📥 Downloads"]
+        tabs = st.tabs(tab_names)
+        tab_md, tab_edit, tab_hitl, tab_ref, tab_dl = tabs
+    else:
+        tab_names = ["📝 Translated Markdown", "✏️ Editable Text",
+                     "📚 References", "📥 Downloads"]
+        tabs = st.tabs(tab_names)
+        tab_md, tab_edit, tab_ref, tab_dl = tabs
+        tab_hitl = None
 
-    doc = doc_store.get(req.doc_id)
-    if not doc:
-        return {"status": "error", "message": "Document not found"}
+    start_edit_time = time.time()
 
-    middle_data = doc.get("middle_json", {})
-    markdown = doc.get("markdown", "")
+    with tab_md:
+        st.markdown(st.session_state.translated_markdown, unsafe_allow_html=True)
 
-    try:
-        agent.set_llm_provider(req.llm_provider)
-        result = await asyncio.to_thread(agent.run, middle_data, markdown)
-        doc["agent_result"] = result
-        doc_store.update(req.doc_id, doc)
-        elapsed = time.time() - t_start
-        print(f"[API] ✅ Agent complete in {elapsed:.1f}s.")
-        return result
-    except Exception as e:
-        print(f"[API] ❌ Agent error: {e}")
-        traceback.print_exc()
-        return {"status": "error", "message": f"Agent failed: {e}"}
+    with tab_edit:
+        st.subheader("✏️ Editable Translated Blocks")
+        st.caption("Each block corresponds to a paragraph in the translated layout. "
+                   "Edit as needed, then submit feedback below.")
 
-
-@app.post("/feedback")
-async def log_feedback(req: FeedbackRequest):
-    print(f"[API] /feedback — doc_id={req.doc_id}, rating={req.user_rating}")
-    try:
-        metrics = evaluator.log_metrics(
-            doc_id=req.doc_id,
-            original_md=req.original_md,
-            modified_md=req.modified_md,
-            user_rating=req.user_rating,
-            download=req.downloaded,
-            time_consumed=req.time_consumed,
+        edited_text = st.text_area(
+            "Edit translated markdown (feedback loop)",
+            st.session_state.translated_markdown,
+            height=500,
         )
-        return {"status": "success", "metrics": metrics}
-    except Exception as e:
-        print(f"[API] ❌ Feedback error: {e}")
-        return {"status": "error", "message": str(e)}
 
+        st.subheader("📊 Submit Evaluation")
+        rating = st.slider("Rate the translation quality (1-5)", 1, 5, 3)
+        downloaded = st.checkbox("Downloaded generated file?")
+        if st.button("📤 Submit Feedback & Save Metrics"):
+            time_consumed = time.time() - start_edit_time
+            try:
+                res = requests.post(f"{API_BASE}/feedback", json={
+                    "doc_id": st.session_state.doc_id,
+                    "original_md": st.session_state.translated_markdown,
+                    "modified_md": edited_text,
+                    "user_rating": rating,
+                    "downloaded": downloaded,
+                    "time_consumed": time_consumed,
+                }, timeout=30)
+                if res.status_code == 200:
+                    st.success(f"✅ Metrics logged: {res.json().get('metrics', {})}")
+                else:
+                    st.error(f"❌ Feedback error: {res.status_code}")
+            except Exception as e:
+                st.error(f"❌ Feedback error: {e}")
 
-# ── HITL ────────────────────────────────────────────────────
+    # HITL Verification Tab
+    if tab_hitl is not None:
+        with tab_hitl:
+            st.subheader("🔧 Human-in-the-Loop Verification")
+            st.caption("Edit flagged translations below and re-render the PDF.")
 
-@app.post("/hitl/update")
-async def hitl_update(req: HITLUpdateRequest):
-    print(f"[API] /hitl/update — doc_id={req.doc_id}, page={req.page_idx}, block={req.block_idx}")
-    doc = doc_store.get(req.doc_id)
-    if not doc:
-        return {"status": "error", "message": "Document not found"}
+            if st.session_state.hitl_blocks:
+                blocks = st.session_state.hitl_blocks
+                st.info(f"Found **{len(blocks)}** flagged elements that need review.")
 
-    translated_middle = doc.get("translated_middle")
-    if not translated_middle:
-        return {"status": "error", "message": "No translated layout found. Run translation first."}
+                for i, block in enumerate(blocks):
+                    with st.expander(
+                        f"⚠️ Page {block['page_idx']+1}, Block {block['block_idx']} "
+                        f"(score: {block.get('score', 0):.3f}, type: {block.get('type', 'text')})",
+                        expanded=(i < 3),
+                    ):
+                        st.caption(f"💡 Suggestion: {block.get('suggestion', 'Manual review recommended')}")
 
-    try:
-        pages = translated_middle.get("pdf_info", [])
-        if req.page_idx >= len(pages):
-            return {"status": "error", "message": f"Page {req.page_idx} out of range"}
+                        st.text_area(
+                            "Original content (read-only)",
+                            block.get("original_content", ""),
+                            height=80,
+                            disabled=True,
+                            key=f"hitl_orig_{i}",
+                        )
 
-        blocks = pages[req.page_idx].get("para_blocks", [])
-        if req.block_idx >= len(blocks):
-            return {"status": "error", "message": f"Block {req.block_idx} out of range"}
+                        new_text = st.text_area(
+                            "Current translation (edit below)",
+                            block.get("current_content", ""),
+                            height=100,
+                            key=f"hitl_edit_{i}",
+                        )
 
-        block = blocks[req.block_idx]
-        block["lines"] = [{
-            "bbox": block.get("bbox", [0, 0, 0, 0]),
-            "spans": [{
-                "bbox": block.get("bbox", [0, 0, 0, 0]),
-                "type": "text",
-                "content": req.new_text,
-                "score": 1.0,
-                "translated": True,
-                "human_edited": True,
-            }]
-        }]
-        doc_store.update(req.doc_id, doc)
-        print(f"[API] ✅ HITL update applied: page {req.page_idx}, block {req.block_idx}")
-        return {"status": "success", "message": "Block updated"}
-    except Exception as e:
-        print(f"[API] ❌ HITL error: {e}")
-        return {"status": "error", "message": str(e)}
+                        if st.button(f"💾 Save Edit", key=f"hitl_save_{i}"):
+                            try:
+                                res = requests.post(f"{API_BASE}/hitl/update", json={
+                                    "doc_id": st.session_state.doc_id,
+                                    "page_idx": block["page_idx"],
+                                    "block_idx": block["block_idx"],
+                                    "new_text": new_text,
+                                }, timeout=10)
+                                if res.status_code == 200 and res.json().get("status") == "success":
+                                    st.success("✅ Block updated!")
+                                else:
+                                    st.error(f"❌ Update failed: {res.json().get('message', 'Unknown error')}")
+                            except Exception as e:
+                                st.error(f"❌ Error: {e}")
 
+                st.divider()
+                if st.button("🔄 Re-render PDF with edits", use_container_width=True):
+                    with st.spinner("📄 Re-rendering PDF with your edits..."):
+                        try:
+                            res = requests.post(
+                                f"{API_BASE}/render-pdf",
+                                json={"doc_id": st.session_state.doc_id},
+                                timeout=LONG_TIMEOUT,
+                            )
+                            if res.status_code == 200 and res.json().get("status") == "success":
+                                st.session_state.pdf_ready = True
+                                st.success("✅ PDF re-rendered with your edits!")
+                            else:
+                                st.error(f"❌ Re-render failed: {res.json().get('message')}")
+                        except Exception as e:
+                            st.error(f"❌ Re-render error: {e}")
+            else:
+                if st.session_state.q4_result:
+                    st.success("✅ No flagged elements — all translations look good!")
+                else:
+                    st.info("No Q4 verification data available.")
 
-@app.get("/hitl/blocks/{doc_id}")
-async def get_hitl_blocks(doc_id: str):
-    doc = doc_store.get(doc_id)
-    if not doc:
-        return {"status": "error", "message": "Document not found"}
+    # References Tab
+    with tab_ref:
+        st.subheader("📚 Keywords & Wikipedia References")
+        kw_result = st.session_state.keywords_result
+        if kw_result and kw_result.get("status") == "success":
+            keywords = kw_result.get("keywords", [])
+            wiki = kw_result.get("wiki_references", [])
+            if wiki:
+                for ref in wiki:
+                    urls = []
+                    if ref.get("url"):
+                        urls.append(f"[Ngôn ngữ đích]({ref['url']})")
+                    if ref.get("en_url") and ref.get("en_url") != ref.get("url"):
+                        urls.append(f"[English]({ref['en_url']})")
+                    if urls:
+                        links = " | ".join(urls)
+                        st.markdown(f"- **{ref['keyword']}** → {links}")
+            elif keywords:
+                st.write(", ".join(keywords))
+            else:
+                st.info("No keywords extracted")
+        else:
+            st.info("Keywords not yet available.")
+            if st.session_state.doc_id and st.button("🔄 Retry Keywords Extraction"):
+                with st.spinner("📚 Extracting keywords..."):
+                    try:
+                        res = requests.post(
+                            f"{API_BASE}/agent/keywords",
+                            json={"doc_id": st.session_state.doc_id, "llm_provider": agent_llm_code},
+                            timeout=120,
+                        )
+                        if res.status_code == 200:
+                            result = res.json()
+                            if result.get("status") == "success":
+                                st.session_state.keywords_result = result
+                                st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Keywords error: {e}")
 
-    agent_result = doc.get("agent_result", {})
-    q4 = agent_result.get("q4_verification", {})
-    translated_middle = doc.get("translated_middle", doc.get("middle_json", {}))
+    # Downloads Tab
+    with tab_dl:
+        st.subheader("📥 Download & Preview")
 
-    flagged_blocks = []
-    for item in q4.get("results", []):
-        if item.get("verdict") == "REVIEW":
-            page_idx = item.get("page", 0)
-            pages = translated_middle.get("pdf_info", [])
-            if page_idx < len(pages):
-                blocks = pages[page_idx].get("para_blocks", [])
-                for bi, block in enumerate(blocks):
-                    for line in block.get("lines", []):
-                        for span in line.get("spans", []):
-                            content = span.get("content", "")
-                            if content and item.get("content", "")[:30] in content[:50]:
-                                flagged_blocks.append({
-                                    "page_idx": page_idx,
-                                    "block_idx": bi,
-                                    "type": block.get("type", "text"),
-                                    "original_content": item.get("content", ""),
-                                    "current_content": content,
-                                    "score": item.get("score", 0),
-                                    "suggestion": item.get("suggestion", ""),
-                                })
-                                break
+        if st.session_state.pdf_ready and st.session_state.doc_id:
+            try:
+                pdf_res = requests.get(
+                    f"{API_BASE}/stream-pdf/{st.session_state.doc_id}",
+                    timeout=30,
+                )
+                if pdf_res.status_code == 200:
+                    import base64
+                    pdf_bytes = pdf_res.content
 
-    return {"status": "success", "flagged_blocks": flagged_blocks, "total": len(flagged_blocks)}
+                    st.divider()
+                    st.subheader("👁️ PDF Preview")
 
+                    base64_pdf = base64.b64encode(pdf_bytes).decode('utf-8')
+                    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="800" type="application/pdf"></iframe>'
+                    st.markdown(pdf_display, unsafe_allow_html=True)
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+                    st.divider()
+                    st.download_button(
+                        "💾 Save Translated PDF",
+                        pdf_bytes,
+                        file_name=f"{st.session_state.doc_id}_translated.pdf",
+                        mime="application/pdf",
+                        use_container_width=True
+                    )
+                else:
+                    st.warning("PDF stream not available")
+            except Exception as e:
+                st.error(f"PDF preview error: {e}")
+        else:
+            st.info("PDF will be available after conversion with layout.json data")
